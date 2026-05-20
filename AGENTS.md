@@ -4,6 +4,7 @@
 
 ## Project principles
 
+- This repo is public, never write non-public information in this repo
 - Keep code and docs brief enough for a human to audit quickly
 - Reuse and improve existing solutions / approaches / designs / helpers / tools / patterns,
   before adding new / similar ones
