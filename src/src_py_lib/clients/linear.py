@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from typing import TypedDict, cast
 
 from src_py_lib.clients.graphql import GraphQLClient, aliased_batched_query
-from src_py_lib.http import HTTPClient
-from src_py_lib.json_types import JSONDict, json_dict, json_list, json_str
+from src_py_lib.utils.http import HTTPClient
+from src_py_lib.utils.json_types import JSONDict, json_dict, json_list, json_str
 
 LINEAR_API_URL = "https://api.linear.app/graphql"
 DEFAULT_ISSUE_BATCH_SIZE = 40

@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 from http.client import HTTPResponse
 from typing import Final, cast
 
-from src_py_lib.json_types import JSONDict, json_dict
-from src_py_lib.logging import event
+from src_py_lib.utils.json_types import JSONDict, json_dict
+from src_py_lib.utils.logging import event
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 30.0
 DEFAULT_MAX_ATTEMPTS: Final[int] = 3

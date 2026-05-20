@@ -11,9 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from src_py_lib.clients.github import GitHubClient, graphql_api_url, pr_ref_from_url
+from src_py_lib.clients.one_password import (
+    OnePasswordClient,
+    OnePasswordError,
+    resolve_op_secret_ref,
+)
 from src_py_lib.clients.sourcegraph import SourcegraphClient
-from src_py_lib.http import HTTPClient, RetryConfig
-from src_py_lib.logging import LoggingConfig, configure_logging, emit_event, log_context
+from src_py_lib.utils.http import HTTPClient, RetryConfig
+from src_py_lib.utils.logging import LoggingConfig, configure_logging, emit_event, log_context
 
 
 class FakeResponse:
@@ -60,6 +65,15 @@ class RecordingHTTP(HTTPClient):
             }
         )
         return {"data": {"viewer": {"username": "alice"}}}
+
+
+class FakeOnePasswordClient(OnePasswordClient):
+    """1Password test double that avoids shelling out."""
+
+    def read(self, secret_ref: str) -> str:
+        if secret_ref == "op://vault/item/field":
+            return "resolved-secret"
+        raise OnePasswordError(f"unexpected secret ref: {secret_ref}")
 
 
 class LoggingTest(unittest.TestCase):
@@ -153,6 +167,19 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(
             graphql_api_url("github.example.com"), "https://github.example.com/api/graphql"
         )
+
+    def test_resolve_op_secret_ref_leaves_raw_values_alone(self) -> None:
+        self.assertEqual(resolve_op_secret_ref(" raw-secret "), "raw-secret")
+
+    def test_resolve_op_secret_ref_uses_one_password_client_for_refs(self) -> None:
+        self.assertEqual(
+            resolve_op_secret_ref("op://vault/item/field", client=FakeOnePasswordClient()),
+            "resolved-secret",
+        )
+
+    def test_resolve_op_secret_ref_rejects_empty_values(self) -> None:
+        with self.assertRaises(OnePasswordError):
+            resolve_op_secret_ref("  ")
 
 
 if __name__ == "__main__":

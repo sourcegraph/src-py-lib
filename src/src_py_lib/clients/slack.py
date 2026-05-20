@@ -8,8 +8,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Final, cast
 
-from src_py_lib.http import HTTPClient, HTTPClientError
-from src_py_lib.json_types import JSONDict, json_dict, json_list, json_str
+from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.json_types import JSONDict, json_dict, json_list, json_str
 
 SLACK_API_URL: Final[str] = "https://slack.com/api"
 DEFAULT_PAGE_LIMIT: Final[int] = 200

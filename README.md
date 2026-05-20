@@ -20,10 +20,10 @@ uv add git+https://github.com/sourcegraph/src-py-lib.git
 
 ## What is included
 
-- `src_py_lib.logging` — centralized human stderr logs plus optional structured
+- `src_py_lib.utils.logging` — centralized human stderr logs plus optional structured
   JSONL events, run IDs, context fields, event timing, retention, startup
   metadata, and sanitized config snapshots.
-- `src_py_lib.http` — stdlib JSON HTTP client with a shared 30-second timeout,
+- `src_py_lib.utils.http` — stdlib JSON HTTP client with a shared 30-second timeout,
   retry policy, `Retry-After` support, and contextual errors.
 - `src_py_lib.clients.sourcegraph` — Sourcegraph GraphQL client.
 - `src_py_lib.clients.linear` — Linear GraphQL client and batched issue lookups.
@@ -34,6 +34,8 @@ uv add git+https://github.com/sourcegraph/src-py-lib.git
   batched PR lookups. Defaults to `https://github.com`; pass `github_url` for
   GitHub Enterprise Server. Keep lightweight for GraphQL; GitHub SDKs help more
   for REST.
+- `src_py_lib.clients.one_password` — tiny 1Password CLI wrapper for resolving
+  `op://...` secret references after config loading.
 - `src_py_lib.clients.google_sheets` — Google Sheets API primitives using gcloud
   Application Default Credentials or a provided access token. Prefer Google's
   official libraries if Sheets usage grows beyond small primitives, because
@@ -47,13 +49,13 @@ pagination, quota behavior, or complex request models.
 
 Configure logging once at process startup. Prefer configuring the root logger
 (`logger_name=""`, the default) so project modules and shared `src_py_lib` modules
-such as `src_py_lib.http` are captured by the same terminal and JSONL handlers.
+such as `src_py_lib.utils.http` are captured by the same terminal and JSONL handlers.
 
 ```python
 from pathlib import Path
 
 from src_py_lib.clients.sourcegraph import SourcegraphClient
-from src_py_lib.logging import (
+from src_py_lib.utils.logging import (
     LoggingConfig,
     configure_logging,
     default_event_file,

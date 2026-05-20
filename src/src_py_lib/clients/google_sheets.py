@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-from src_py_lib.http import HTTPClient, HTTPClientError
-from src_py_lib.json_types import JSONDict, json_dict, json_int, json_list, json_str
+from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.json_types import JSONDict, json_dict, json_int, json_list, json_str
 
 SHEETS_API_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 DEFAULT_ADC_FILE = Path("~/.config/gcloud/application_default_credentials.json").expanduser()

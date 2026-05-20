@@ -10,8 +10,8 @@ from typing import TypedDict, cast
 from urllib.parse import urlsplit
 
 from src_py_lib.clients.graphql import GraphQLClient, aliased_batched_query
-from src_py_lib.http import HTTPClient
-from src_py_lib.json_types import JSONDict, json_dict, json_str
+from src_py_lib.utils.http import HTTPClient
+from src_py_lib.utils.json_types import JSONDict, json_dict, json_str
 
 DEFAULT_GITHUB_URL = "https://github.com"
 DEFAULT_PR_BATCH_SIZE = 50

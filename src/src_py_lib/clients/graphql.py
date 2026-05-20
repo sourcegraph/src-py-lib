@@ -6,8 +6,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from src_py_lib.http import HTTPClient, HTTPClientError
-from src_py_lib.json_types import JSONDict, json_dict
+from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.json_types import JSONDict, json_dict
 
 _OPERATION_NAME_RE = re.compile(r"\b(?:query|mutation|subscription)\s+(\w+)")
 

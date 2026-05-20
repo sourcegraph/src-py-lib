@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src_py_lib.clients.graphql import GraphQLClient
-from src_py_lib.http import HTTPClient
-from src_py_lib.json_types import JSONDict
+from src_py_lib.utils.http import HTTPClient
+from src_py_lib.utils.json_types import JSONDict
 
 
 @dataclass
