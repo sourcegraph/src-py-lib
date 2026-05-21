@@ -1283,6 +1283,59 @@ query Items($first: Int!, $after: String) {
         with self.assertRaisesRegex(RuntimeError, "viewer.email"):
             client.validate()
 
+    def test_linear_client_list_users_paginates(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "users": {
+                            "nodes": [{"id": "U1", "name": "Alice"}],
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "cursor-1",
+                            },
+                        }
+                    }
+                },
+                {
+                    "data": {
+                        "users": {
+                            "nodes": [{"id": "U2", "name": "Bob"}],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        }
+                    }
+                },
+            ]
+        )
+
+        users = LinearClient("token", http=http).list_users(page_size=25)
+
+        self.assertEqual([user["id"] for user in users], ["U1", "U2"])
+        first_body = json_dict(http.calls[0]["json_body"])
+        second_body = json_dict(http.calls[1]["json_body"])
+        self.assertEqual(
+            json_dict(first_body.get("variables")),
+            {"first": 25, "after": None},
+        )
+        self.assertEqual(
+            json_dict(second_body.get("variables")),
+            {"first": 25, "after": "cursor-1"},
+        )
+
+    def test_json_cache_helpers_round_trip_and_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "cache.json"
+
+            src.save_json_cache(path, {"b": {"name": "Bob"}, "a": {"name": "Alice"}})
+            parsed = src.load_json_cache(path, parse=lambda value: str(value.get("name", "")))
+            subset = src.load_json_subset(path, ["a", "missing"], parse=lambda value: value)
+
+        self.assertEqual(parsed, {"a": "Alice", "b": "Bob"})
+        self.assertEqual(subset, {"a": {"name": "Alice"}})
+
     def test_resolve_op_secret_ref_leaves_raw_values_alone(self) -> None:
         self.assertEqual(resolve_op_secret_ref(" raw-secret "), "raw-secret")
 

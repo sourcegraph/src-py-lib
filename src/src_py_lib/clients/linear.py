@@ -8,13 +8,38 @@ from dataclasses import dataclass, field
 from src_py_lib.clients.graphql import GraphQLClient
 from src_py_lib.utils.config import Config, config_field
 from src_py_lib.utils.http import HTTPClient
-from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict
+from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_dicts
 
 LINEAR_API_URL = "https://api.linear.app/graphql"
 LINEAR_VALIDATE_QUERY = """
 query LinearClientValidate {
   viewer {
     email
+  }
+}
+"""
+LINEAR_USERS_QUERY = """
+query LinearUsers($first: Int!, $after: String) {
+  users(first: $first, after: $after, includeArchived: true) {
+    nodes {
+      id
+      name
+      displayName
+      email
+      teamMemberships(first: 25) {
+        nodes {
+          team {
+            id
+            key
+            name
+          }
+        }
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
   }
 }
 """
@@ -60,6 +85,11 @@ class LinearClient:
         if not viewer.get("email"):
             raise RuntimeError("Linear viewer response did not include viewer.email.")
         return viewer
+
+    def list_users(self, *, page_size: int = 100) -> list[JSONDict]:
+        """Return every Linear user with common people-directory fields."""
+        data = self.graphql(LINEAR_USERS_QUERY, page_size=page_size)
+        return json_dicts(json_dict(data.get("users")).get("nodes"))
 
 
 def linear_client_from_config(

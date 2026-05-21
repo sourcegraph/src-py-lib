@@ -7,7 +7,12 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 
 from src_py_lib.clients.github import GitHubClient, PullRequest, gh_cli_token, pr_ref_from_url
-from src_py_lib.clients.google_sheets import GoogleSheetsClient, GoogleSheetsError
+from src_py_lib.clients.google_sheets import (
+    GoogleSheetsClient,
+    GoogleSheetsError,
+    gcloud_adc_access_token,
+    quota_project_from_adc,
+)
 from src_py_lib.clients.graphql import (
     GraphQLClient,
     GraphQLError,
@@ -36,6 +41,7 @@ from src_py_lib.utils.config import (
     config_parse_args as parse_args,
 )
 from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.json_cache import load_json_cache, load_json_subset, save_json_cache
 from src_py_lib.utils.json_types import (
     JSONDict,
     json_dict,
@@ -112,6 +118,7 @@ __all__ = [
     "error",
     "event",
     "gh_cli_token",
+    "gcloud_adc_access_token",
     "info",
     "introspect_schema",
     "json_dict",
@@ -121,11 +128,15 @@ __all__ = [
     "json_str",
     "json_strs",
     "linear_client_from_config",
+    "load_json_cache",
+    "load_json_subset",
     "logging",
     "log",
     "log_context",
     "parse_args",
     "pr_ref_from_url",
+    "quota_project_from_adc",
+    "save_json_cache",
     "slack_client_from_config",
     "startup_event",
     "warning",
