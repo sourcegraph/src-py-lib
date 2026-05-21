@@ -92,25 +92,25 @@ snapshots do not expose resolved values.
 Configure logging once at process startup. Prefer configuring the root logger
 (`logger_name=""`, the default) so project modules and shared `src_py_lib` modules
 such as `src_py_lib.utils.http` are captured by the same terminal and JSONL handlers.
+Structured `event()` blocks emit `trace`, `span`, and nested `parent_span` fields.
+When the root logger is configured, noisy `httpx`/`httpcore` records are suppressed;
+`HTTPClient` emits structured `http_request` events instead.
+Set `SRC_LOG_LEVEL=INFO` for a run to omit DEBUG events from the log file.
 
 ```python
-from pathlib import Path
-
 from src_py_lib.clients.sourcegraph import SourcegraphClient
 from src_py_lib.utils.logging import (
     LoggingConfig,
     configure_logging,
-    default_event_file,
     startup_event,
 )
 
-event_file = configure_logging(
+log_file = configure_logging(
     LoggingConfig(
         logger_name="",
-        event_file=default_event_file(Path("logs")),
     )
 )
-startup_event(command="sync", config={"src_token": "provided"}, event_file=event_file)
+startup_event(command="sync", config={"src_token": "provided"}, log_file=log_file)
 
 client = SourcegraphClient("https://sourcegraph.example.com", "token")
 data = client.graphql("query Viewer { currentUser { username } }")

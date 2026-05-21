@@ -7,7 +7,7 @@ import logging
 import random
 import time
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Final, cast
 
@@ -23,6 +23,16 @@ DEFAULT_RETRY_BASE_DELAY_SECONDS: Final[float] = 0.5
 DEFAULT_RETRY_MAX_DELAY_SECONDS: Final[float] = 30.0
 RETRYABLE_STATUS_CODES: Final[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
 ERROR_BODY_PREVIEW_CHARS: Final[int] = 500
+REDACTED_HEADER_VALUE: Final[str] = "[redacted]"
+SENSITIVE_HEADER_FRAGMENTS: Final[tuple[str, ...]] = (
+    "api-key",
+    "api_key",
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +109,8 @@ class HTTPClient:
                     method=method,
                     url=_safe_url(request_url),
                     attempt=attempt,
+                    request_headers=_headers_for_log(request_headers),
+                    request_bytes=len(body or b""),
                 ) as fields:
                     response = self._client.request(
                         method,
@@ -108,7 +120,12 @@ class HTTPClient:
                     )
                     payload = response.content
                     fields["status_code"] = response.status_code
+                    fields["reason_phrase"] = response.reason_phrase
+                    fields["response_headers"] = _headers_for_log(response.headers)
                     fields["response_bytes"] = len(payload)
+                    http_version = _response_http_version(response)
+                    if http_version is not None:
+                        fields["http_version"] = http_version
                     if response.status_code >= 400:
                         body_text = _body_preview(payload)
                         if not self._should_retry(response.status_code, attempt):
@@ -187,6 +204,41 @@ def _with_query(
 def _safe_url(url: str) -> str:
     split = urllib.parse.urlsplit(url)
     return urllib.parse.urlunsplit((split.scheme, split.netloc, split.path, split.query, ""))
+
+
+def _headers_for_log(headers: Mapping[str, str] | httpx.Headers) -> dict[str, str | list[str]]:
+    values: dict[str, str | list[str]] = {}
+    for name, value in _header_items(headers):
+        key = name.lower()
+        logged_value = REDACTED_HEADER_VALUE if _is_sensitive_header(key) else value
+        existing = values.get(key)
+        if existing is None:
+            values[key] = logged_value
+        elif isinstance(existing, list):
+            existing.append(logged_value)
+        else:
+            values[key] = [existing, logged_value]
+    return {key: values[key] for key in sorted(values)}
+
+
+def _header_items(headers: Mapping[str, str] | httpx.Headers) -> Iterable[tuple[str, str]]:
+    if isinstance(headers, httpx.Headers):
+        return headers.multi_items()
+    return headers.items()
+
+
+def _is_sensitive_header(name: str) -> bool:
+    lowered = name.lower()
+    return any(fragment in lowered for fragment in SENSITIVE_HEADER_FRAGMENTS)
+
+
+def _response_http_version(response: httpx.Response) -> str | None:
+    version = response.extensions.get("http_version")
+    if isinstance(version, bytes):
+        return version.decode("latin-1", errors="replace")
+    if isinstance(version, str):
+        return version
+    return None
 
 
 def _body_preview(raw: bytes) -> str:

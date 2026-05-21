@@ -50,8 +50,11 @@ from src_py_lib.utils.http import HTTPClient, HTTPClientError
 from src_py_lib.utils.json_types import JSONDict, json_dict, json_list
 from src_py_lib.utils.logging import (
     LoggingConfig,
+    LoggingConfigMixin,
     configure_logging,
+    default_log_file,
     emit_event,
+    event,
     log_context,
     startup_event,
 )
@@ -164,6 +167,13 @@ class RequiredConfig(Config):
     )
 
 
+class SnapshotOrderConfig(Config):
+    """Config model whose field names and env-var names sort differently."""
+
+    alpha: str = config_field("a", env_var="ZZZ_ALPHA")
+    zulu: str = config_field("z", env_var="AAA_ZULU")
+
+
 class LinearExampleConfig(LinearClientConfig):
     """Config model composed from Linear client fields and app fields."""
 
@@ -186,6 +196,10 @@ class SourcegraphExampleConfig(SourcegraphClientConfig):
         metavar="QUERY",
         help="Example Sourcegraph repository query.",
     )
+
+
+class LoggingExampleConfig(LoggingConfigMixin):
+    """Config model composed from shared logging fields."""
 
 
 class ConfigTest(unittest.TestCase):
@@ -297,16 +311,33 @@ class ConfigTest(unittest.TestCase):
             self.assertTrue(config.include_archived)
             self.assertEqual(config.output_dir, base_dir / "from-cli")
             self.assertEqual(config.labels, ("gamma", "delta"))
+            snapshot = config_snapshot(config)
             self.assertEqual(
-                config_snapshot(config),
+                list(snapshot),
+                [
+                    "EXAMPLE_INCLUDE_ARCHIVED",
+                    "EXAMPLE_LABELS",
+                    "EXAMPLE_OUTPUT_DIR",
+                    "EXAMPLE_PAGE_SIZE",
+                    "EXAMPLE_TOKEN",
+                ],
+            )
+            self.assertEqual(
+                snapshot,
                 {
-                    "EXAMPLE_TOKEN": "provided",
-                    "EXAMPLE_PAGE_SIZE": 40,
                     "EXAMPLE_INCLUDE_ARCHIVED": True,
-                    "EXAMPLE_OUTPUT_DIR": str(base_dir / "from-cli"),
                     "EXAMPLE_LABELS": ["gamma", "delta"],
+                    "EXAMPLE_OUTPUT_DIR": str(base_dir / "from-cli"),
+                    "EXAMPLE_PAGE_SIZE": 40,
+                    "EXAMPLE_TOKEN": "provided",
                 },
             )
+
+    def test_config_snapshot_sorts_emitted_keys(self) -> None:
+        snapshot = config_snapshot(SnapshotOrderConfig())
+
+        self.assertEqual(list(snapshot), ["AAA_ZULU", "ZZZ_ALPHA"])
+        self.assertEqual(snapshot, {"AAA_ZULU": "z", "ZZZ_ALPHA": "a"})
 
     def test_argparse_helpers_add_flags_and_collect_overrides(self) -> None:
         parser = argparse.ArgumentParser()
@@ -336,6 +367,27 @@ class ConfigTest(unittest.TestCase):
                 "labels": "one,two",
             },
         )
+
+    def test_logging_config_mixin_adds_log_level_from_cli_and_env(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_config_arguments(parser, LoggingExampleConfig)
+        args = parser.parse_args(["--src-log-level", "INFO"])
+
+        cli_config = load_config_from_args(
+            LoggingExampleConfig,
+            args,
+            env={"SRC_LOG_LEVEL": "WARNING"},
+            resolve_op_refs=False,
+        )
+        env_config = load_config(
+            LoggingExampleConfig,
+            env_file=None,
+            env={"SRC_LOG_LEVEL": "ERROR"},
+            resolve_op_refs=False,
+        )
+
+        self.assertEqual(cli_config.src_log_level, "INFO")
+        self.assertEqual(env_config.src_log_level, "ERROR")
 
     def test_config_parse_args_loads_config_and_reports_config_errors(self) -> None:
         config = config_parse_args(
@@ -421,18 +473,84 @@ class GraphQLTest(unittest.TestCase):
 
 
 class LoggingTest(unittest.TestCase):
-    def test_structured_event_file_includes_context_and_sanitized_terminal_omits_event(
+    def test_default_log_file_uses_dashed_timestamp_offset_and_run(self) -> None:
+        path = default_log_file(Path("logs"), run="1ea51330")
+
+        self.assertEqual(path.parent, Path("logs"))
+        self.assertRegex(
+            path.name,
+            r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{4}-1ea51330\.json$",
+        )
+
+    def test_configure_logging_defaults_log_file_under_logs_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logs_dir = Path(directory) / "logs"
+            logger_name = "src_py_lib_test_default_logs_dir"
+            log_file = configure_logging(
+                LoggingConfig(
+                    logger_name=logger_name,
+                    terminal_level=logging.CRITICAL,
+                    logs_dir=logs_dir,
+                    run="test-run",
+                )
+            )
+            try:
+                emit_event("default_log_path", logger_name=logger_name)
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            if log_file is None:
+                self.fail("configure_logging did not return a default log file")
+            self.assertEqual(log_file.parent, logs_dir)
+            self.assertRegex(
+                log_file.name,
+                r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{4}-test-run\.json$",
+            )
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            self.assertTrue(any(row.get("event") == "default_log_path" for row in rows))
+
+    def test_src_log_level_env_controls_log_file_level(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "src_py_lib_test_log_level"
+            with patch.dict("os.environ", {"SRC_LOG_LEVEL": "INFO"}):
+                configure_logging(
+                    LoggingConfig(
+                        logger_name=logger_name,
+                        terminal_level=logging.CRITICAL,
+                        log_file=log_file,
+                        run="test-run",
+                    )
+                )
+            try:
+                emit_event("debug_event", level=logging.DEBUG, logger_name=logger_name)
+                emit_event("info_event", level=logging.INFO, logger_name=logger_name)
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            events = [row["event"] for row in rows]
+            self.assertNotIn("debug_event", events)
+            self.assertIn("info_event", events)
+
+    def test_structured_log_file_includes_context_and_sanitized_terminal_omits_event(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            event_file = Path(directory) / "events.jsonl"
+            log_file = Path(directory) / "events.json"
             logger_name = "src_py_lib_test_logging"
             configure_logging(
                 LoggingConfig(
                     logger_name=logger_name,
                     terminal_level=logging.INFO,
-                    event_file=event_file,
-                    run_id="test-run",
+                    log_file=log_file,
+                    run="test-run",
                 )
             )
             try:
@@ -449,14 +567,201 @@ class LoggingTest(unittest.TestCase):
                     logger.removeHandler(handler)
                     handler.close()
 
-            rows = [json.loads(line) for line in event_file.read_text().splitlines()]
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
             startup = next(row for row in rows if row["event"] == "startup")
             self.assertEqual(startup["git_commit"], "abc1234")
             self.assertFalse(any("git_commit" in row for row in rows if row["event"] != "startup"))
+            self.assertEqual(
+                list(rows[0]),
+                ["ts", "level", "run", "logger", "event", "message"],
+            )
+            self.assertEqual(
+                rows[0]["message"],
+                f"Writing log events to {log_file}.",
+            )
+            self.assertEqual(
+                list(startup),
+                [
+                    "ts",
+                    "command",
+                    "level",
+                    "run",
+                    "event",
+                    "git_commit",
+                    "log_file",
+                ],
+            )
+            self.assertEqual(
+                list(rows[-1]),
+                ["ts", "command", "level", "run", "event", "answer"],
+            )
             self.assertEqual(rows[-1]["event"], "example")
-            self.assertEqual(rows[-1]["run_id"], "test-run")
+            self.assertEqual(rows[-1]["run"], "test-run")
             self.assertEqual(rows[-1]["command"], "unit-test")
             self.assertEqual(rows[-1]["answer"], 42)
+
+    def test_event_context_adds_trace_and_span_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "src_py_lib_test_traces"
+            configure_logging(
+                LoggingConfig(
+                    logger_name=logger_name,
+                    terminal_level=logging.INFO,
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                with event("outer", logger_name=logger_name):
+                    emit_event("inside", logger_name=logger_name, answer=42)
+                    with event("inner", logger_name=logger_name):
+                        logging.getLogger(logger_name).info("inside nested span")
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            outer_start = next(
+                row for row in rows if row["event"] == "outer" and row["phase"] == "start"
+            )
+            outer_end = next(
+                row for row in rows if row["event"] == "outer" and row["phase"] == "end"
+            )
+            inside = next(row for row in rows if row["event"] == "inside")
+            inner_start = next(
+                row for row in rows if row["event"] == "inner" and row["phase"] == "start"
+            )
+            inner_end = next(
+                row for row in rows if row["event"] == "inner" and row["phase"] == "end"
+            )
+            inner_log = next(row for row in rows if row.get("message") == "inside nested span")
+
+            self.assertEqual(
+                list(outer_start),
+                ["ts", "level", "run", "trace", "span", "event", "phase"],
+            )
+            self.assertEqual(outer_start["trace"], outer_end["trace"])
+            self.assertEqual(outer_start["span"], outer_end["span"])
+            self.assertEqual(len(outer_start["trace"]), 8)
+            self.assertEqual(len(outer_start["span"]), 8)
+            self.assertNotIn("parent_span", outer_start)
+
+            self.assertEqual(inside["trace"], outer_start["trace"])
+            self.assertEqual(inside["span"], outer_start["span"])
+
+            self.assertEqual(
+                list(inner_start),
+                [
+                    "ts",
+                    "level",
+                    "run",
+                    "trace",
+                    "span",
+                    "parent_span",
+                    "event",
+                    "phase",
+                ],
+            )
+            self.assertEqual(inner_start["trace"], outer_start["trace"])
+            self.assertEqual(inner_start["span"], inner_end["span"])
+            self.assertEqual(len(inner_start["span"]), 8)
+            self.assertEqual(inner_start["parent_span"], outer_start["span"])
+            self.assertNotEqual(inner_start["span"], outer_start["span"])
+
+            self.assertEqual(
+                list(inner_log),
+                [
+                    "ts",
+                    "level",
+                    "run",
+                    "trace",
+                    "span",
+                    "parent_span",
+                    "logger",
+                    "event",
+                    "message",
+                ],
+            )
+            self.assertEqual(inner_log["trace"], outer_start["trace"])
+            self.assertEqual(inner_log["span"], inner_start["span"])
+            self.assertEqual(inner_log["parent_span"], outer_start["span"])
+
+    def test_httpx_request_logs_are_debug_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "httpx"
+            configure_logging(
+                LoggingConfig(
+                    logger_name=logger_name,
+                    terminal_level=logging.CRITICAL,
+                    log_file_level=logging.DEBUG,
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                logging.getLogger(logger_name).info(
+                    'HTTP Request: POST https://api.linear.app/graphql "HTTP/1.1 200 OK"'
+                )
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            request_log = next(
+                row for row in rows if row.get("message", "").startswith("HTTP Request:")
+            )
+            self.assertEqual(request_log["level"], "DEBUG")
+
+    def test_httpcore_response_headers_are_structured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "httpcore"
+            configure_logging(
+                LoggingConfig(
+                    logger_name=logger_name,
+                    terminal_level=logging.INFO,
+                    log_file_level=logging.DEBUG,
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                logging.getLogger("httpcore.http11").debug(
+                    "receive_response_headers.complete "
+                    "return_value=(b'HTTP/1.1', 200, b'OK', "
+                    "[(b'Zed', b'last'), (b'Content-Type', b'application/json'), "
+                    "(b'Alpha', b'first')])"
+                )
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            response_headers = next(
+                row for row in rows if row.get("message") == "receive_response_headers.complete"
+            )
+
+            self.assertEqual(response_headers["logger"], "httpcore.http11")
+            self.assertEqual(response_headers["http_version"], "HTTP/1.1")
+            self.assertEqual(response_headers["status_code"], 200)
+            self.assertEqual(response_headers["reason_phrase"], "OK")
+            self.assertEqual(list(response_headers["headers"]), ["alpha", "content-type", "zed"])
+            self.assertEqual(
+                response_headers["headers"],
+                {
+                    "alpha": "first",
+                    "content-type": "application/json",
+                    "zed": "last",
+                },
+            )
 
 
 class HTTPClientTest(unittest.TestCase):
@@ -490,6 +795,62 @@ class HTTPClientTest(unittest.TestCase):
         self.assertEqual(seen["user_agent"], "src-py-lib")
         self.assertEqual(json.loads(seen["body"]), {"hello": "world"})
         self.assertEqual(client.max_connections, 7)
+
+    def test_json_request_emits_structured_http_event(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ok": True},
+                headers={
+                    "Zed": "last",
+                    "Content-Type": "application/json",
+                    "Set-Cookie": "session=secret",
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            configure_logging(
+                LoggingConfig(
+                    terminal_level=logging.CRITICAL,
+                    log_file_level=logging.DEBUG,
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                client = HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler))
+                payload = client.json(
+                    "POST",
+                    "https://example.com/api",
+                    headers={"Authorization": "Bearer token"},
+                    json_body={"hello": "world"},
+                )
+            finally:
+                logger = logging.getLogger("")
+                for handler_ in list(logger.handlers):
+                    logger.removeHandler(handler_)
+                    handler_.close()
+
+            self.assertEqual(payload, {"ok": True})
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            http_request = next(
+                row
+                for row in rows
+                if row.get("event") == "http_request" and row.get("phase") == "end"
+            )
+
+            self.assertFalse(any(row.get("logger") in {"httpx", "httpcore"} for row in rows))
+            self.assertEqual(http_request["status_code"], 200)
+            self.assertEqual(http_request["reason_phrase"], "OK")
+            self.assertEqual(http_request["request_bytes"], len(b'{"hello": "world"}'))
+            self.assertEqual(http_request["request_headers"]["authorization"], "[redacted]")
+            self.assertEqual(
+                list(http_request["response_headers"]), sorted(http_request["response_headers"])
+            )
+            self.assertEqual(http_request["response_headers"]["content-type"], "application/json")
+            self.assertEqual(http_request["response_headers"]["set-cookie"], "[redacted]")
+            self.assertEqual(http_request["response_headers"]["zed"], "last")
 
     def test_json_request_wraps_timeouts(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -594,6 +955,82 @@ query Items($first: Int!, $after: String, $userId: ID!) {
             http.calls[1]["json_body"]["variables"],
             {"userId": "u1", "first": 2, "after": "cursor-1"},
         )
+
+    def test_graphql_client_emits_query_debug_events(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "viewer": {
+                            "items": {
+                                "nodes": [{"id": "1"}],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": "cursor-1",
+                                },
+                            }
+                        }
+                    }
+                },
+                {
+                    "data": {
+                        "viewer": {
+                            "items": {
+                                "nodes": [{"id": "2"}],
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                            }
+                        }
+                    }
+                },
+            ]
+        )
+        client = GraphQLClient("https://example.com/graphql", {}, "Example", http=http)
+        query = """
+query Items($first: Int!, $after: String, $userId: ID!) {
+  viewer { items { nodes { id } pageInfo { hasNextPage endCursor } } }
+}
+"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            configure_logging(
+                LoggingConfig(
+                    terminal_level=logging.CRITICAL,
+                    log_file_level=logging.DEBUG,
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                client.execute(query, variables={"userId": "u1"}, page_size=2)
+            finally:
+                logger = logging.getLogger("")
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            starts = [
+                row
+                for row in rows
+                if row.get("event") == "graphql_query" and row.get("phase") == "start"
+            ]
+            ends = [
+                row
+                for row in rows
+                if row.get("event") == "graphql_query" and row.get("phase") == "end"
+            ]
+
+            self.assertEqual([row["query_name"] for row in starts], ["Items", "Items"])
+            self.assertEqual([row["page_number"] for row in starts], [1, 2])
+            self.assertEqual([row["page_size"] for row in starts], [2, 2])
+            self.assertEqual([row["cursor_present"] for row in starts], [False, True])
+            self.assertEqual(starts[0]["graphql_client"], "Example")
+            self.assertEqual(starts[0]["variable_names"], ["after", "first", "userId"])
+            self.assertEqual(ends[0]["response_fields"], ["viewer"])
 
     def test_graphql_client_requires_end_cursor_for_next_page(self) -> None:
         http = RecordingHTTP(

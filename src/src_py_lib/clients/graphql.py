@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from typing import cast
 
 from src_py_lib.utils.http import HTTPClient, HTTPClientError
 from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list, json_str
+from src_py_lib.utils.logging import event
 
 _OPERATION_NAME_RE = re.compile(r"\b(?:query|mutation|subscription)\s+(\w+)")
 
@@ -143,10 +145,29 @@ class GraphQLClient:
         ):
             page_variables[after_variable] = None
 
-        data = self._execute_once(query, page_variables)
+        page_number = 1
+        data = self._execute_once(
+            query,
+            page_variables,
+            page_number=page_number,
+            first_variable=first_variable,
+            after_variable=after_variable,
+        )
         if follow_pages:
+
+            def execute_next_page(next_variables: JSONDict) -> JSONDict:
+                nonlocal page_number
+                page_number += 1
+                return self._execute_once(
+                    query,
+                    next_variables,
+                    page_number=page_number,
+                    first_variable=first_variable,
+                    after_variable=after_variable,
+                )
+
             _fetch_remaining_pages(
-                lambda next_variables: self._execute_once(query, next_variables),
+                execute_next_page,
                 data,
                 page_variables,
                 after_variable=after_variable,
@@ -154,23 +175,53 @@ class GraphQLClient:
             )
         return data
 
-    def _execute_once(self, query: str, variables: JSONDict) -> JSONDict:
+    def _execute_once(
+        self,
+        query: str,
+        variables: JSONDict,
+        *,
+        page_number: int = 1,
+        first_variable: str = "first",
+        after_variable: str = "after",
+    ) -> JSONDict:
         body = {"query": query, "variables": variables or {}}
-        try:
-            payload = self.http.json("POST", self.url, headers=self.headers, json_body=body)
-        except HTTPClientError as exception:
-            raise GraphQLError(f"{self.label} GraphQL request failed: {exception}") from exception
-        errors = payload.get("errors")
-        data = json_dict(payload.get("data"))
-        if errors and not (self.tolerate_partial_errors and data):
-            raise GraphQLError(f"{self.label} GraphQL errors: {errors}")
-        return data
+        with event(
+            "graphql_query",
+            level=logging.DEBUG,
+            graphql_client=self.label,
+            query_name=operation_name(query),
+            page_number=page_number,
+            page_size=_int_variable(variables, first_variable),
+            cursor_present=variables.get(after_variable) is not None,
+            url=self.url,
+            variable_names=sorted(variables),
+            query_bytes=len(query.encode("utf-8")),
+        ) as fields:
+            try:
+                payload = self.http.json("POST", self.url, headers=self.headers, json_body=body)
+            except HTTPClientError as exception:
+                raise GraphQLError(
+                    f"{self.label} GraphQL request failed: {exception}"
+                ) from exception
+            errors = payload.get("errors")
+            data = json_dict(payload.get("data"))
+            fields["response_fields"] = sorted(data)
+            if errors:
+                fields["graphql_errors"] = len(errors) if isinstance(errors, list) else 1
+            if errors and not (self.tolerate_partial_errors and data):
+                raise GraphQLError(f"{self.label} GraphQL errors: {errors}")
+            return data
 
 
 def operation_name(query: str) -> str:
     """Extract the operation name from a GraphQL document."""
     match = _OPERATION_NAME_RE.search(query)
     return match.group(1) if match else "anonymous"
+
+
+def _int_variable(variables: JSONDict, name: str) -> int | None:
+    value = variables.get(name)
+    return value if isinstance(value, int) else None
 
 
 def introspect_schema(

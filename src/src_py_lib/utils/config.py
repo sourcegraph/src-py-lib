@@ -297,7 +297,7 @@ def resolve_config_refs[ConfigT: Config](
 def config_snapshot(config: Config) -> dict[str, object]:
     """Return a Config snapshot with secret values reduced to safe states."""
     snapshot: dict[str, object] = {}
-    for option in config_options(type(config)):
+    for option in sorted(config_options(type(config)), key=lambda option: option.env_var):
         value = getattr(config, option.field_name)
         snapshot[option.env_var] = _secret_state(value) if option.secret else _snapshot_value(value)
     return snapshot
