@@ -29,6 +29,8 @@ uv add git+https://github.com/sourcegraph/src-py-lib.git
   reference resolution.
 - `src_py_lib.utils.http` — pooled `httpx` JSON HTTP client with a shared
   30-second timeout, retry policy, `Retry-After` support, and contextual errors.
+- `src_py_lib.utils.tsv` — padded TSV writer for human-readable tabular exports,
+  with newline/tab cleanup, URL preservation, and Unicode-aware column widths.
 - `src_py_lib.clients.graphql` — shared GraphQL execution with automatic cursor
   pagination, batched alias lookups, and schema introspection export.
 - `src_py_lib.clients.sourcegraph` — Sourcegraph GraphQL client with token
@@ -58,16 +60,16 @@ pagination, quota behavior, or complex request models.
 ## Example
 
 Define one project-specific `Config` model, then load it once at CLI startup.
+For common CLI and client usage, import the curated root API:
 
 ```python
 from pathlib import Path
 
-from src_py_lib.clients.linear import LinearClientConfig, linear_client_from_config
-from src_py_lib.utils.config import config_field, config_parse_args
+import src_py_lib as src
 
 
-class LinearExportConfig(LinearClientConfig):
-    output_dir: Path = config_field(
+class LinearExportConfig(src.LinearClientConfig):
+    output_dir: Path = src.config_field(
         Path("."),
         env_var="LINEAR_EXPORT_OUTPUT_DIR",
         cli_flag="--output-dir",
@@ -75,15 +77,15 @@ class LinearExportConfig(LinearClientConfig):
         help="Directory for generated files.",
     )
 
-config = config_parse_args(LinearExportConfig, description="Export Linear data.")
-client = linear_client_from_config(config)
+config = src.parse_args(LinearExportConfig, description="Export Linear data.")
+client = src.linear_client_from_config(config)
 print(f"Writing files under {config.output_dir}")
 ```
 
 Config precedence is: code defaults, `.env`, shell environment, then CLI
 overrides. API client modules can provide shared Config base classes such as
-`LinearClientConfig`, and `config_parse_args` resolves `op://...` references by
-default. Pass a custom `argparse.ArgumentParser` to `config_parse_args` when a
+`LinearClientConfig`, and `parse_args` resolves `op://...` references by
+default. Pass a custom `argparse.ArgumentParser` to `parse_args` when a
 CLI also has non-Config flags. Mark sensitive fields with `secret=True` so
 snapshots do not expose resolved values.
 
@@ -92,28 +94,24 @@ snapshots do not expose resolved values.
 Configure logging once at process startup. Prefer configuring the root logger
 (`logger_name=""`, the default) so project modules and shared `src_py_lib` modules
 such as `src_py_lib.utils.http` are captured by the same terminal and JSONL handlers.
-Structured `event()` blocks emit `trace`, `span`, and nested `parent_span` fields.
+Use `logging()` in CLIs to configure logging, add the command field to all
+structured events, and emit standard startup metadata.
+Use `debug()`, `info()`, `warning()`, `error()`, and `critical()` for one-off
+structured events. Use `event()` blocks around timed work; they emit `trace`,
+`span`, and nested `parent_span` fields.
 When the root logger is configured, noisy `httpx`/`httpcore` records are suppressed;
 `HTTPClient` emits structured `http_request` events instead.
 Set `SRC_LOG_LEVEL=INFO` for a run to omit DEBUG events from the log file.
 
 ```python
+import src_py_lib as src
 from src_py_lib.clients.sourcegraph import SourcegraphClient
-from src_py_lib.utils.logging import (
-    LoggingConfig,
-    configure_logging,
-    startup_event,
-)
 
-log_file = configure_logging(
-    LoggingConfig(
-        logger_name="",
-    )
-)
-startup_event(command="sync", config={"src_token": "provided"}, log_file=log_file)
+with src.logging({"src_token": "provided"}):
+    src.info("sync_started", repository_count=3)
 
-client = SourcegraphClient("https://sourcegraph.example.com", "token")
-data = client.graphql("query Viewer { currentUser { username } }")
+    client = SourcegraphClient("https://sourcegraph.example.com", "token")
+    data = client.graphql("query Viewer { currentUser { username } }")
 ```
 
 ## Development

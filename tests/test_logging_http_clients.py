@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import httpx
 
+import src_py_lib as src
 from src_py_lib.clients.github import GitHubClient, graphql_api_url, pr_ref_from_url
 from src_py_lib.clients.google_sheets import GoogleSheetsClient
 from src_py_lib.clients.graphql import GraphQLClient, GraphQLError, introspect_schema
@@ -50,13 +51,18 @@ from src_py_lib.utils.http import HTTPClient, HTTPClientError
 from src_py_lib.utils.json_types import JSONDict, json_dict, json_list
 from src_py_lib.utils.logging import (
     LoggingConfig,
-    LoggingConfigMixin,
+    LoggingSettings,
     configure_logging,
+    critical,
+    debug,
     default_log_file,
-    emit_event,
+    error,
     event,
+    info,
+    log,
     log_context,
     startup_event,
+    warning,
 )
 
 
@@ -198,7 +204,7 @@ class SourcegraphExampleConfig(SourcegraphClientConfig):
     )
 
 
-class LoggingExampleConfig(LoggingConfigMixin):
+class LoggingExampleConfig(LoggingConfig):
     """Config model composed from shared logging fields."""
 
 
@@ -487,15 +493,15 @@ class LoggingTest(unittest.TestCase):
             logs_dir = Path(directory) / "logs"
             logger_name = "src_py_lib_test_default_logs_dir"
             log_file = configure_logging(
-                LoggingConfig(
+                LoggingSettings(
                     logger_name=logger_name,
-                    terminal_level=logging.CRITICAL,
+                    terminal_level="critical",
                     logs_dir=logs_dir,
                     run="test-run",
                 )
             )
             try:
-                emit_event("default_log_path", logger_name=logger_name)
+                info("default_log_path", logger_name=logger_name)
             finally:
                 logger = logging.getLogger(logger_name)
                 for handler in list(logger.handlers):
@@ -518,16 +524,16 @@ class LoggingTest(unittest.TestCase):
             logger_name = "src_py_lib_test_log_level"
             with patch.dict("os.environ", {"SRC_LOG_LEVEL": "INFO"}):
                 configure_logging(
-                    LoggingConfig(
+                    LoggingSettings(
                         logger_name=logger_name,
-                        terminal_level=logging.CRITICAL,
+                        terminal_level="critical",
                         log_file=log_file,
                         run="test-run",
                     )
                 )
             try:
-                emit_event("debug_event", level=logging.DEBUG, logger_name=logger_name)
-                emit_event("info_event", level=logging.INFO, logger_name=logger_name)
+                debug("debug_event", logger_name=logger_name)
+                info("info_event", logger_name=logger_name)
             finally:
                 logger = logging.getLogger(logger_name)
                 for handler in list(logger.handlers):
@@ -539,6 +545,69 @@ class LoggingTest(unittest.TestCase):
             self.assertNotIn("debug_event", events)
             self.assertIn("info_event", events)
 
+    def test_log_and_level_helpers_use_string_levels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "src_py_lib_test_string_levels"
+            configure_logging(
+                LoggingSettings(
+                    logger_name=logger_name,
+                    terminal_level="critical",
+                    log_file_level="debug",
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                log("bogus", "fallback_debug", logger_name=logger_name)
+                warning("warning_event", logger_name=logger_name)
+                error("error_event", logger_name=logger_name)
+                critical("critical_event", logger_name=logger_name)
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            levels = {row["event"]: row["level"] for row in rows}
+            self.assertEqual(levels["fallback_debug"], "DEBUG")
+            self.assertEqual(levels["warning_event"], "WARNING")
+            self.assertEqual(levels["error_event"], "ERROR")
+            self.assertEqual(levels["critical_event"], "CRITICAL")
+
+    def test_logging_configures_logging_context_and_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "src_py_lib_test_logging_context"
+            config = ExampleConfig(token="secret-token")
+            try:
+                with src.logging(
+                    config,
+                    command="unit-test",
+                    git_cwd=__file__,
+                    logging_config=LoggingSettings(
+                        logger_name=logger_name,
+                        terminal_level="critical",
+                        log_file=log_file,
+                        run="test-run",
+                    ),
+                ) as context_log_file:
+                    self.assertEqual(context_log_file, log_file)
+                    info("inside_command", logger_name=logger_name)
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            startup = next(row for row in rows if row["event"] == "startup")
+            inside = next(row for row in rows if row["event"] == "inside_command")
+            self.assertEqual(startup["command"], "unit-test")
+            self.assertEqual(startup["config"]["EXAMPLE_TOKEN"], "provided")
+            self.assertEqual(inside["command"], "unit-test")
+
     def test_structured_log_file_includes_context_and_sanitized_terminal_omits_event(
         self,
     ) -> None:
@@ -546,9 +615,9 @@ class LoggingTest(unittest.TestCase):
             log_file = Path(directory) / "events.json"
             logger_name = "src_py_lib_test_logging"
             configure_logging(
-                LoggingConfig(
+                LoggingSettings(
                     logger_name=logger_name,
-                    terminal_level=logging.INFO,
+                    terminal_level="info",
                     log_file=log_file,
                     run="test-run",
                 )
@@ -560,7 +629,7 @@ class LoggingTest(unittest.TestCase):
                     git_commit="abc1234",
                 )
                 with log_context(command="unit-test"):
-                    emit_event("example", logger_name=logger_name, answer=42)
+                    info("example", logger_name=logger_name, answer=42)
             finally:
                 logger = logging.getLogger(logger_name)
                 for handler in list(logger.handlers):
@@ -605,16 +674,16 @@ class LoggingTest(unittest.TestCase):
             log_file = Path(directory) / "events.json"
             logger_name = "src_py_lib_test_traces"
             configure_logging(
-                LoggingConfig(
+                LoggingSettings(
                     logger_name=logger_name,
-                    terminal_level=logging.INFO,
+                    terminal_level="info",
                     log_file=log_file,
                     run="test-run",
                 )
             )
             try:
                 with event("outer", logger_name=logger_name):
-                    emit_event("inside", logger_name=logger_name, answer=42)
+                    info("inside", logger_name=logger_name, answer=42)
                     with event("inner", logger_name=logger_name):
                         logging.getLogger(logger_name).info("inside nested span")
             finally:
@@ -694,10 +763,10 @@ class LoggingTest(unittest.TestCase):
             log_file = Path(directory) / "events.json"
             logger_name = "httpx"
             configure_logging(
-                LoggingConfig(
+                LoggingSettings(
                     logger_name=logger_name,
-                    terminal_level=logging.CRITICAL,
-                    log_file_level=logging.DEBUG,
+                    terminal_level="critical",
+                    log_file_level="debug",
                     log_file=log_file,
                     run="test-run",
                 )
@@ -723,10 +792,10 @@ class LoggingTest(unittest.TestCase):
             log_file = Path(directory) / "events.json"
             logger_name = "httpcore"
             configure_logging(
-                LoggingConfig(
+                LoggingSettings(
                     logger_name=logger_name,
-                    terminal_level=logging.INFO,
-                    log_file_level=logging.DEBUG,
+                    terminal_level="info",
+                    log_file_level="debug",
                     log_file=log_file,
                     run="test-run",
                 )
@@ -811,9 +880,9 @@ class HTTPClientTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
             configure_logging(
-                LoggingConfig(
-                    terminal_level=logging.CRITICAL,
-                    log_file_level=logging.DEBUG,
+                LoggingSettings(
+                    terminal_level="critical",
+                    log_file_level="debug",
                     log_file=log_file,
                     run="test-run",
                 )
@@ -997,9 +1066,9 @@ query Items($first: Int!, $after: String, $userId: ID!) {
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
             configure_logging(
-                LoggingConfig(
-                    terminal_level=logging.CRITICAL,
-                    log_file_level=logging.DEBUG,
+                LoggingSettings(
+                    terminal_level="critical",
+                    log_file_level="debug",
                     log_file=log_file,
                     run="test-run",
                 )

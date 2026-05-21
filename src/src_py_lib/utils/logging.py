@@ -2,7 +2,7 @@
 
 Use `configure_logging()` once near process startup. Other modules should use
 `logging.getLogger(__name__)` for human-readable operator messages and
-`event()` / `emit_event()` for structured JSONL events.
+`event()` / `log()` for structured JSONL events.
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
 
-from src_py_lib.utils.config import Config, config_field
+from src_py_lib.utils.config import Config, config_field, config_snapshot
 
 RUN: Final[str] = secrets.token_hex(4)
 DEFAULT_LOGS_DIR: Final[Path] = Path("logs")
 DEFAULT_RETAIN_FILES: Final[int] = 50
-DEFAULT_LOG_FILE_LEVEL: Final[int] = logging.DEBUG
+DEFAULT_LOG_FILE_LEVEL: Final[str] = "debug"
 SRC_LOG_LEVEL: Final[str] = "SRC_LOG_LEVEL"
 TRACE_SPAN_BYTES: Final[int] = 4
 SECRET_FIELD_FRAGMENTS: Final[tuple[str, ...]] = (
@@ -62,12 +62,12 @@ _CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("src_p
 
 
 @dataclass(frozen=True)
-class LoggingConfig:
+class LoggingSettings:
     """Logging destinations and levels."""
 
     logger_name: str = ""
-    terminal_level: int = logging.INFO
-    log_file_level: int | str | None = None
+    terminal_level: str = "info"
+    log_file_level: str | None = None
     log_file: Path | None = None
     logs_dir: Path | None = DEFAULT_LOGS_DIR
     run: str = RUN
@@ -75,7 +75,7 @@ class LoggingConfig:
     suppress_http_dependency_logs: bool = True
 
 
-class LoggingConfigMixin(Config):
+class LoggingConfig(Config):
     """Config fields for logging-related CLI and environment options."""
 
     src_log_level: str | None = config_field(
@@ -164,12 +164,12 @@ class JSONLogFileHandler(logging.Handler):
         super().close()
 
 
-def configure_logging(config: LoggingConfig | None = None) -> Path | None:
+def configure_logging(config: LoggingSettings | None = None) -> Path | None:
     """Configure terminal logging and optional JSON log-file logging.
 
     Returns the JSON log-file path when file logging is enabled.
     """
-    config = config or LoggingConfig()
+    config = config or LoggingSettings()
     terminal_level = _log_level(config.terminal_level)
     log_file_level = _log_file_level(config.log_file_level)
     log_file = config.log_file
@@ -210,6 +210,30 @@ def configure_logging(config: LoggingConfig | None = None) -> Path | None:
     return log_file
 
 
+@contextlib.contextmanager
+def logging_context(
+    name: str,
+    config: object | None = None,
+    *,
+    git_cwd: Path | str | None = None,
+    logging_config: LoggingSettings | None = None,
+) -> Generator[Path | None]:
+    """Configure logging, install command context, and emit startup metadata."""
+    resolved_logging_config = logging_config or LoggingSettings(
+        log_file_level=_src_log_level_from_config(config)
+    )
+    log_file = configure_logging(resolved_logging_config)
+    with log_context(command=name):
+        startup_event(
+            command=name,
+            config=config,
+            log_file=log_file,
+            git_cwd=_git_cwd_path(git_cwd),
+            logger_name=resolved_logging_config.logger_name,
+        )
+        yield log_file
+
+
 def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Path:
     """Return a timestamped log-file path under `logs_dir`."""
     timestamp = _datetime.datetime.now(_datetime.UTC).strftime("%Y-%m-%d-%H-%M-%S-%z")
@@ -217,27 +241,51 @@ def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Pa
     return logs_dir / f"{timestamp}-{run}.json"
 
 
-def emit_event(
-    name: str, *, level: int = logging.INFO, logger_name: str = "", **fields: Any
-) -> None:
-    """Emit one structured event through the configured logger."""
+def log(level: str, key: str, *, logger_name: str = "", **fields: Any) -> None:
+    """Log one structured event through the configured logger."""
+    numeric_level = _log_level(level)
     logger = logging.getLogger(logger_name)
-    if not logger.isEnabledFor(level):
+    if not logger.isEnabledFor(numeric_level):
         return
     logger.log(
-        level,
+        numeric_level,
         "event=%s",
-        name,
+        key,
         extra={
-            _STRUCTURED_EVENT_ATTR: name,
+            _STRUCTURED_EVENT_ATTR: key,
             _STRUCTURED_FIELDS_ATTR: {**_current_log_fields(), **fields},
         },
     )
 
 
+def debug(key: str, *, logger_name: str = "", **fields: Any) -> None:
+    """Log a DEBUG structured event."""
+    log("debug", key, logger_name=logger_name, **fields)
+
+
+def info(key: str, *, logger_name: str = "", **fields: Any) -> None:
+    """Log an INFO structured event."""
+    log("info", key, logger_name=logger_name, **fields)
+
+
+def warning(key: str, *, logger_name: str = "", **fields: Any) -> None:
+    """Log a WARNING structured event."""
+    log("warning", key, logger_name=logger_name, **fields)
+
+
+def error(key: str, *, logger_name: str = "", **fields: Any) -> None:
+    """Log an ERROR structured event."""
+    log("error", key, logger_name=logger_name, **fields)
+
+
+def critical(key: str, *, logger_name: str = "", **fields: Any) -> None:
+    """Log a CRITICAL structured event."""
+    log("critical", key, logger_name=logger_name, **fields)
+
+
 @contextlib.contextmanager
 def log_context(**fields: Any) -> Generator[None]:
-    """Add inherited structured fields for nested `emit_event()` calls."""
+    """Add inherited structured fields for nested `log()` calls."""
     reset_token = _CONTEXT.set({**_CONTEXT.get({}), **fields})
     try:
         yield
@@ -247,7 +295,7 @@ def log_context(**fields: Any) -> Generator[None]:
 
 @contextlib.contextmanager
 def event(
-    name: str, *, level: int = logging.INFO, logger_name: str = "", **fields: Any
+    key: str, *, level: str = "info", logger_name: str = "", **fields: Any
 ) -> Generator[dict[str, Any]]:
     """Emit start/end structured events around a block of work."""
     parent = _SPAN_CONTEXT.get()
@@ -258,7 +306,7 @@ def event(
     )
     reset_token = _SPAN_CONTEXT.set(span)
     try:
-        emit_event(name, level=level, logger_name=logger_name, phase="start", **fields)
+        log(level, key, logger_name=logger_name, phase="start", **fields)
         started = time.perf_counter()
         extra: dict[str, Any] = {}
         error: BaseException | None = None
@@ -276,9 +324,9 @@ def event(
                 "status": "error" if error else "ok",
                 "error_type": type(error).__name__ if error else None,
             }
-            emit_event(
-                name,
-                level=logging.ERROR if error else level,
+            log(
+                "error" if error else level,
+                key,
                 logger_name=logger_name,
                 **end_fields,
             )
@@ -346,8 +394,9 @@ def startup_event(
     if commit:
         fields["git_commit"] = commit
     if config is not None:
-        fields["config"] = sanitized_config_snapshot(config)
-    emit_event("startup", logger_name=logger_name, **fields)
+        config_value = config_snapshot(config) if isinstance(config, Config) else config
+        fields["config"] = sanitized_config_snapshot(config_value)
+    info("startup", logger_name=logger_name, **fields)
 
 
 def git_short_hash(cwd: Path | None = None) -> str | None:
@@ -379,13 +428,25 @@ def _ordered_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return ordered
 
 
-def _log_file_level(configured_level: int | str | None) -> int:
+def _log_file_level(configured_level: str | None) -> int:
     if configured_level is not None:
         return _log_level(configured_level)
     env_level = os.environ.get(SRC_LOG_LEVEL)
     if env_level:
         return _log_level(env_level)
-    return DEFAULT_LOG_FILE_LEVEL
+    return _log_level(DEFAULT_LOG_FILE_LEVEL)
+
+
+def _src_log_level_from_config(config: object | None) -> str | None:
+    value = getattr(config, "src_log_level", None)
+    return value if isinstance(value, str) else None
+
+
+def _git_cwd_path(value: Path | str | None) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    return path.parent if path.is_file() else path
 
 
 def _log_level(value: int | str) -> int:
@@ -393,14 +454,13 @@ def _log_level(value: int | str) -> int:
         return value
     normalized = value.strip().upper()
     if not normalized:
-        raise ValueError("Log level must not be empty")
+        return logging.DEBUG
     if normalized.isdecimal():
         return int(normalized)
     levels = logging.getLevelNamesMapping()
     level = levels.get(normalized)
     if level is None:
-        valid_levels = ", ".join(sorted(levels))
-        raise ValueError(f"Unknown log level {value!r}; expected one of: {valid_levels}")
+        return logging.DEBUG
     return level
 
 

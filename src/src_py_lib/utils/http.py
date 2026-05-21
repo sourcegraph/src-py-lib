@@ -105,7 +105,7 @@ class HTTPClient:
             try:
                 with event(
                     "http_request",
-                    level=logging.DEBUG,
+                    level="debug",
                     method=method,
                     url=_safe_url(request_url),
                     attempt=attempt,
