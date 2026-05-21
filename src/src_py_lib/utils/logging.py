@@ -239,14 +239,18 @@ def startup_event(
     command: str,
     config: object | None = None,
     event_file: Path | None = None,
+    git_commit: str | None = None,
+    git_cwd: Path | None = None,
     logger_name: str = "",
 ) -> None:
     """Emit standard startup metadata after logging is configured."""
     fields: dict[str, Any] = {
         "command": command,
-        "git_commit": git_short_hash(),
         "event_file": str(event_file) if event_file else None,
     }
+    commit = git_commit or git_short_hash(git_cwd)
+    if commit:
+        fields["git_commit"] = commit
     if config is not None:
         fields["config"] = sanitized_config_snapshot(config)
     emit_event("startup", logger_name=logger_name, **fields)

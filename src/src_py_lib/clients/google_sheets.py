@@ -77,6 +77,13 @@ class GoogleSheetsClient:
     def metadata(self) -> JSONDict:
         return self.request("GET", "?fields=sheets.properties(sheetId,title,gridProperties)")
 
+    def validate(self) -> JSONDict:
+        """Validate spreadsheet access and return spreadsheet metadata."""
+        metadata = self.metadata()
+        if not isinstance(metadata.get("sheets"), list):
+            raise GoogleSheetsError("Google Sheets metadata response did not include sheets.")
+        return metadata
+
     def tab_ids_by_title(self) -> dict[str, int]:
         return {
             json_str(properties, "title"): json_int(properties, "sheetId")

@@ -15,6 +15,13 @@ from src_py_lib.utils.json_types import JSONDict, json_dict, json_str
 
 DEFAULT_GITHUB_URL = "https://github.com"
 DEFAULT_PR_BATCH_SIZE = 50
+GITHUB_VALIDATE_QUERY = """
+query GitHubClientValidate {
+  viewer {
+    login
+  }
+}
+"""
 PR_REF_RE = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^/#]+)#(?P<number>\d+)$")
 PR_URL_RE = re.compile(
     r"https?://[^/\s)>|]+/(?P<owner>[^/\s)>|]+)/(?P<repo>[^/\s)>|]+)/pull/(?P<number>\d+)"
@@ -54,6 +61,13 @@ class GitHubClient:
             http=self.http,
             tolerate_partial_errors=True,
         ).execute(query, variables)
+
+    def validate(self) -> JSONDict:
+        """Validate the token with a cheap viewer query and return the viewer."""
+        viewer = json_dict(self.graphql(GITHUB_VALIDATE_QUERY).get("viewer"))
+        if not viewer.get("login"):
+            raise RuntimeError("GitHub viewer response did not include viewer.login.")
+        return viewer
 
     def get_pull_requests(
         self, refs: list[str], *, batch_size: int = DEFAULT_PR_BATCH_SIZE

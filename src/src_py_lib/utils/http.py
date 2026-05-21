@@ -6,25 +6,23 @@ import json
 import logging
 import random
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from http.client import HTTPResponse
 from typing import Final, cast
+
+import httpx
 
 from src_py_lib.utils.json_types import JSONDict, json_dict
 from src_py_lib.utils.logging import event
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 30.0
+DEFAULT_MAX_CONNECTIONS: Final[int] = 20
 DEFAULT_MAX_ATTEMPTS: Final[int] = 3
 DEFAULT_RETRY_BASE_DELAY_SECONDS: Final[float] = 0.5
 DEFAULT_RETRY_MAX_DELAY_SECONDS: Final[float] = 30.0
 RETRYABLE_STATUS_CODES: Final[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
 ERROR_BODY_PREVIEW_CHARS: Final[int] = 500
-
-UrlOpen = Callable[..., HTTPResponse]
 
 logger = logging.getLogger(__name__)
 
@@ -38,24 +36,43 @@ class HTTPClientError(RuntimeError):
         self.body = body
 
 
-@dataclass(frozen=True)
-class RetryConfig:
-    """Retry policy for transient HTTP failures."""
-
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS
-    base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
-    max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
-    retryable_status_codes: frozenset[int] = RETRYABLE_STATUS_CODES
-
-
 @dataclass
 class HTTPClient:
-    """Small stdlib HTTP client for JSON APIs."""
+    """HTTPX-backed HTTP client for JSON APIs with pooled connections."""
 
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
-    retry: RetryConfig = field(default_factory=RetryConfig)
+    timeout: float | httpx.Timeout = DEFAULT_TIMEOUT_SECONDS
     user_agent: str = "src-py-lib"
-    opener: UrlOpen = urllib.request.urlopen
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
+    retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
+    retryable_status_codes: frozenset[int] = RETRYABLE_STATUS_CODES
+    transport: httpx.BaseTransport | None = field(default=None, repr=False)
+    _client: httpx.Client = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self._client = httpx.Client(
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=self.max_connections,
+                max_keepalive_connections=self.max_connections,
+            ),
+            transport=self.transport,
+        )
+
+    def __enter__(self) -> HTTPClient:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the underlying pooled HTTP transport."""
+        self._client.close()
 
     def request(
         self,
@@ -74,10 +91,7 @@ class HTTPClient:
         if json_body is not None:
             body = json.dumps(json_body).encode("utf-8")
             request_headers.setdefault("Content-Type", "application/json")
-        request = urllib.request.Request(
-            request_url, data=body, headers=request_headers, method=method
-        )
-        for attempt in range(1, self.retry.max_attempts + 1):
+        for attempt in range(1, self.max_attempts + 1):
             try:
                 with event(
                     "http_request",
@@ -86,26 +100,41 @@ class HTTPClient:
                     url=_safe_url(request_url),
                     attempt=attempt,
                 ) as fields:
-                    response = self.opener(request, timeout=self.timeout_seconds)
-                    with response:
-                        payload = response.read()
-                        fields["status_code"] = response.status
-                        fields["response_bytes"] = len(payload)
+                    response = self._client.request(
+                        method,
+                        request_url,
+                        headers=request_headers,
+                        content=body,
+                    )
+                    payload = response.content
+                    fields["status_code"] = response.status_code
+                    fields["response_bytes"] = len(payload)
+                    if response.status_code >= 400:
+                        body_text = _body_preview(payload)
+                        if not self._should_retry(response.status_code, attempt):
+                            raise HTTPClientError(
+                                f"HTTP {response.status_code} for {method} "
+                                f"{_safe_url(request_url)}: {body_text}",
+                                status_code=response.status_code,
+                                body=body_text,
+                            )
+                        self._sleep_before_retry(attempt, response.headers.get("Retry-After"))
+                    else:
                         return payload
-            except urllib.error.HTTPError as exception:
-                body_text = _read_error_body(exception)
-                if not self._should_retry(exception.code, attempt):
+            except HTTPClientError:
+                raise
+            except httpx.TimeoutException as exception:
+                if not self._should_retry(None, attempt):
                     raise HTTPClientError(
-                        f"HTTP {exception.code} for {method} {_safe_url(request_url)}: {body_text}",
-                        status_code=exception.code,
-                        body=body_text,
+                        f"HTTP request timed out for {method} {_safe_url(request_url)}: "
+                        f"{_exception_message(exception)}"
                     ) from exception
-                self._sleep_before_retry(attempt, exception.headers.get("Retry-After"))
-            except urllib.error.URLError as exception:
+                self._sleep_before_retry(attempt, None)
+            except httpx.TransportError as exception:
                 if not self._should_retry(None, attempt):
                     raise HTTPClientError(
                         f"HTTP request failed for {method} {_safe_url(request_url)}: "
-                        f"{exception.reason}"
+                        f"{_exception_message(exception)}"
                     ) from exception
                 self._sleep_before_retry(attempt, None)
         raise AssertionError("HTTP retry loop exited without returning or raising")
@@ -129,16 +158,16 @@ class HTTPClient:
             ) from exception
 
     def _should_retry(self, status_code: int | None, attempt: int) -> bool:
-        if attempt >= self.retry.max_attempts:
+        if attempt >= self.max_attempts:
             return False
-        return status_code is None or status_code in self.retry.retryable_status_codes
+        return status_code is None or status_code in self.retryable_status_codes
 
     def _sleep_before_retry(self, attempt: int, retry_after: str | None) -> None:
         delay = _retry_after_seconds(retry_after)
         if delay is None:
             delay = min(
-                self.retry.base_delay_seconds * (2 ** (attempt - 1)),
-                self.retry.max_delay_seconds,
+                self.retry_base_delay_seconds * (2 ** (attempt - 1)),
+                self.retry_max_delay_seconds,
             ) * random.uniform(0.5, 1.5)
         logger.warning("HTTP request failed; retrying in %.2fs (attempt %d).", delay, attempt + 1)
         time.sleep(delay)
@@ -160,12 +189,15 @@ def _safe_url(url: str) -> str:
     return urllib.parse.urlunsplit((split.scheme, split.netloc, split.path, split.query, ""))
 
 
-def _read_error_body(exception: urllib.error.HTTPError) -> str:
-    raw = exception.read()
+def _body_preview(raw: bytes) -> str:
     text = raw.decode("utf-8", errors="replace").strip()
     if len(text) <= ERROR_BODY_PREVIEW_CHARS:
         return text
     return f"{text[:ERROR_BODY_PREVIEW_CHARS]}... (+{len(text) - ERROR_BODY_PREVIEW_CHARS} chars)"
+
+
+def _exception_message(exception: Exception) -> str:
+    return str(exception) or type(exception).__name__
 
 
 def _retry_after_seconds(value: str | None) -> float | None:

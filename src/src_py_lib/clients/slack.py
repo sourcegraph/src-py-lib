@@ -103,6 +103,13 @@ class SlackClient:
     def list_users(self) -> list[JSONDict]:
         return self.paginate("users.list", collection_key="members")
 
+    def validate(self) -> JSONDict:
+        """Validate the token with Slack auth.test and return the response."""
+        data = self.get("auth.test")
+        if not json_str(data, "user_id"):
+            raise SlackError("Slack auth.test response did not include user_id.")
+        return data
+
     def workspace_url(self) -> str:
         url = json_str(self.get("auth.test"), "url").strip().rstrip("/")
         if not url:
