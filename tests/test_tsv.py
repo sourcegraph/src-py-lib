@@ -41,7 +41,6 @@ class TSVTest(unittest.TestCase):
 
             src.write_tsv(
                 output_file,
-                ["name", "n"],
                 [
                     {"name": "al", "n": 1},
                     {"name": "bob", "n": 2},
@@ -52,6 +51,14 @@ class TSVTest(unittest.TestCase):
                 output_file.read_text(encoding="utf-8"),
                 "name\tn\nal  \t1\nbob \t2\n",
             )
+
+    def test_write_tsv_writes_empty_file_for_empty_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_file = Path(directory) / "table.tsv"
+
+            src.write_tsv(output_file, [])
+
+            self.assertEqual(output_file.read_text(encoding="utf-8"), "")
 
 
 if __name__ == "__main__":

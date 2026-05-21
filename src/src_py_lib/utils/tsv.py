@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Final
 
@@ -13,16 +13,18 @@ _ZERO_WIDTH_CATEGORIES: Final[frozenset[str]] = frozenset({"Cf", "Me", "Mn"})
 
 def write_tsv(
     path: Path,
-    fieldnames: Sequence[str],
     rows: Iterable[Mapping[str, object]],
     *,
     max_column_width: int = DEFAULT_MAX_COLUMN_WIDTH,
 ) -> None:
-    """Write rows as a padded TSV table, including a header row."""
-    table: list[Mapping[str, object]] = [
-        dict(zip(fieldnames, fieldnames, strict=True)),
-        *list(rows),
-    ]
+    """Write rows as a padded TSV table, inferring the header from row keys."""
+    data_rows = list(rows)
+    fieldnames = list(data_rows[0]) if data_rows else []
+    table: list[Mapping[str, object]] = []
+    if fieldnames:
+        table.append(dict(zip(fieldnames, fieldnames, strict=True)))
+    table.extend(data_rows)
+
     widths = {
         field: max(
             display_width(
