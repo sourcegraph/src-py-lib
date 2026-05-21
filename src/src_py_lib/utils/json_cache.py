@@ -5,19 +5,17 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import cast
-
-from src_py_lib.utils.json_types import JSONDict
+from typing import Any, cast
 
 
 def load_json_cache[Entry](
     path: Path,
-    parse: Callable[[JSONDict], Entry] | None = None,
+    parse: Callable[[Any], Entry] | None = None,
 ) -> dict[str, Entry]:
     """Load `path` as a string-keyed cache. Missing files return `{}`."""
     if not path.exists():
         return {}
-    raw = cast(dict[str, JSONDict], json.loads(path.read_text(encoding="utf-8")))
+    raw = cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
     if parse is None:
         return cast(dict[str, Entry], raw)
     return {key: parse(value) for key, value in raw.items()}
@@ -32,7 +30,7 @@ def save_json_cache(path: Path, cache: Mapping[str, object]) -> None:
 def load_json_subset[Entry](
     path: Path,
     keys: list[str],
-    parse: Callable[[JSONDict], Entry] | None = None,
+    parse: Callable[[Any], Entry] | None = None,
 ) -> dict[str, Entry]:
     """Load only `keys` that are present in a string-keyed JSON cache."""
     cache = load_json_cache(path, parse=parse)
