@@ -6,11 +6,25 @@ import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
 
-from src_py_lib.clients.graphql import GraphQLError, introspect_schema
+from src_py_lib.clients.github import GitHubClient, PullRequest, gh_cli_token, pr_ref_from_url
+from src_py_lib.clients.google_sheets import GoogleSheetsClient, GoogleSheetsError
+from src_py_lib.clients.graphql import (
+    GraphQLClient,
+    GraphQLError,
+    aliased_batched_query,
+    introspect_schema,
+)
 from src_py_lib.clients.linear import (
     LinearClient,
     LinearClientConfig,
     linear_client_from_config,
+)
+from src_py_lib.clients.slack import (
+    SlackClient,
+    SlackClientConfig,
+    SlackError,
+    SlackPacer,
+    slack_client_from_config,
 )
 from src_py_lib.utils.config import (
     Config,
@@ -21,7 +35,16 @@ from src_py_lib.utils.config import (
 from src_py_lib.utils.config import (
     config_parse_args as parse_args,
 )
-from src_py_lib.utils.json_types import JSONDict, json_dict, json_list
+from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.json_types import (
+    JSONDict,
+    json_dict,
+    json_dicts,
+    json_int,
+    json_list,
+    json_str,
+    json_strs,
+)
 from src_py_lib.utils.logging import (
     LoggingConfig,
     LoggingSettings,
@@ -64,11 +87,23 @@ __all__ = [
     "Config",
     "ConfigError",
     "GraphQLError",
+    "GraphQLClient",
+    "GitHubClient",
+    "GoogleSheetsClient",
+    "GoogleSheetsError",
+    "HTTPClient",
+    "HTTPClientError",
     "JSONDict",
     "LinearClient",
     "LinearClientConfig",
     "LoggingConfig",
     "LoggingSettings",
+    "PullRequest",
+    "SlackClient",
+    "SlackClientConfig",
+    "SlackError",
+    "SlackPacer",
+    "aliased_batched_query",
     "config_field",
     "config_snapshot",
     "configure_logging",
@@ -76,15 +111,22 @@ __all__ = [
     "debug",
     "error",
     "event",
+    "gh_cli_token",
     "info",
     "introspect_schema",
     "json_dict",
+    "json_dicts",
+    "json_int",
     "json_list",
+    "json_str",
+    "json_strs",
     "linear_client_from_config",
     "logging",
     "log",
     "log_context",
     "parse_args",
+    "pr_ref_from_url",
+    "slack_client_from_config",
     "startup_event",
     "warning",
     "write_tsv",

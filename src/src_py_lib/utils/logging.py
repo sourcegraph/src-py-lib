@@ -476,7 +476,7 @@ def _structured_log_fields(record: logging.LogRecord) -> tuple[str, dict[str, An
             object,
             ast.literal_eval(message.removeprefix(_HTTPCORE_RESPONSE_HEADERS_PREFIX)),
         )
-    except SyntaxError, ValueError:
+    except (SyntaxError, ValueError):
         return message, fields
     if not isinstance(literal_value, tuple):
         return message, fields

@@ -40,10 +40,18 @@ logger = logging.getLogger(__name__)
 class HTTPClientError(RuntimeError):
     """Raised when an HTTP request fails after retries."""
 
-    def __init__(self, message: str, *, status_code: int | None = None, body: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        body: str = "",
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.headers = {key.lower(): value for key, value in dict(headers or {}).items()}
 
 
 @dataclass
@@ -134,6 +142,7 @@ class HTTPClient:
                                 f"{_safe_url(request_url)}: {body_text}",
                                 status_code=response.status_code,
                                 body=body_text,
+                                headers=dict(response.headers),
                             )
                         self._sleep_before_retry(attempt, response.headers.get("Retry-After"))
                     else:

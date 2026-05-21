@@ -14,15 +14,25 @@ class PackageImportTest(unittest.TestCase):
         self.assertIsNotNone(src_py_lib)
 
     def test_root_public_api_exports_common_entrypoints(self) -> None:
+        self.assertIsNotNone(src_py_lib.GitHubClient)
+        self.assertIsNotNone(src_py_lib.GraphQLClient)
+        self.assertIsNotNone(src_py_lib.HTTPClient)
+        self.assertIsNotNone(src_py_lib.JSONDict)
         self.assertIsNotNone(src_py_lib.LinearClientConfig)
         self.assertIsNotNone(src_py_lib.LoggingConfig)
         self.assertIsNotNone(src_py_lib.LoggingSettings)
+        self.assertIsNotNone(src_py_lib.SlackClient)
+        self.assertIsNotNone(src_py_lib.SlackPacer)
         self.assertIsNotNone(src_py_lib.config_field)
+        self.assertIsNotNone(src_py_lib.gh_cli_token)
         self.assertIsNotNone(src_py_lib.info)
+        self.assertIsNotNone(src_py_lib.json_dicts)
+        self.assertIsNotNone(src_py_lib.json_str)
         self.assertIsNotNone(src_py_lib.log)
         self.assertIsNotNone(src_py_lib.logging)
         self.assertIsNotNone(src_py_lib.linear_client_from_config)
         self.assertIsNotNone(src_py_lib.parse_args)
+        self.assertIsNotNone(src_py_lib.slack_client_from_config)
         self.assertIsNotNone(src_py_lib.write_tsv)
 
 

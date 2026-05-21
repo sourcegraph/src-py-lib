@@ -19,6 +19,22 @@ def json_list(value: object) -> JSONArray:
     return cast(JSONArray, value) if isinstance(value, list) else []
 
 
+def json_dicts(value: object) -> list[JSONDict]:
+    """Return `value` as a list of JSON objects, filtering non-objects out."""
+    if not isinstance(value, list):
+        return []
+    items = cast(list[object], value)
+    return [cast(JSONDict, item) for item in items if isinstance(item, dict)]
+
+
+def json_strs(value: object) -> list[str]:
+    """Return `value` as a list of strings, filtering non-strings out."""
+    if not isinstance(value, list):
+        return []
+    items = cast(list[object], value)
+    return [item for item in items if isinstance(item, str)]
+
+
 def json_str(mapping: JSONDict, key: str, default: str = "") -> str:
     """Read a string value from a JSON object."""
     value = mapping.get(key)
