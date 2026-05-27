@@ -14,7 +14,7 @@ from typing import Final, cast
 import httpx
 
 from src_py_lib.utils.json_types import JSONDict, json_dict
-from src_py_lib.utils.logging import event
+from src_py_lib.utils.logging import event, record_http_attempt, record_http_retry
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 30.0
 DEFAULT_MAX_CONNECTIONS: Final[int] = 20
@@ -134,6 +134,11 @@ class HTTPClient:
                     http_version = _response_http_version(response)
                     if http_version is not None:
                         fields["http_version"] = http_version
+                    record_http_attempt(
+                        request_bytes=len(body or b""),
+                        response_bytes=len(payload),
+                        status_code=response.status_code,
+                    )
                     if response.status_code >= 400:
                         body_text = _body_preview(payload)
                         if not self._should_retry(response.status_code, attempt):
@@ -144,24 +149,29 @@ class HTTPClient:
                                 body=body_text,
                                 headers=dict(response.headers),
                             )
+                        record_http_retry()
                         self._sleep_before_retry(attempt, response.headers.get("Retry-After"))
                     else:
                         return payload
             except HTTPClientError:
                 raise
             except httpx.TimeoutException as exception:
+                record_http_attempt(request_bytes=len(body or b""), transport_error=True)
                 if not self._should_retry(None, attempt):
                     raise HTTPClientError(
                         f"HTTP request timed out for {method} {_safe_url(request_url)}: "
                         f"{_exception_message(exception)}"
                     ) from exception
+                record_http_retry()
                 self._sleep_before_retry(attempt, None)
             except httpx.TransportError as exception:
+                record_http_attempt(request_bytes=len(body or b""), transport_error=True)
                 if not self._should_retry(None, attempt):
                     raise HTTPClientError(
                         f"HTTP request failed for {method} {_safe_url(request_url)}: "
                         f"{_exception_message(exception)}"
                     ) from exception
+                record_http_retry()
                 self._sleep_before_retry(attempt, None)
         raise AssertionError("HTTP retry loop exited without returning or raising")
 

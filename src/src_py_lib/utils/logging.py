@@ -16,12 +16,19 @@ import logging
 import os
 import secrets
 import subprocess
+import sys
 import threading
 import time
-from collections.abc import Generator, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Generator, Iterable, Mapping
+from concurrent.futures import Executor, Future
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Self, cast
+
+if sys.platform != "win32":
+    import resource
+
+from pydantic import model_validator
 
 from src_py_lib.utils.config import Config, config_field, config_snapshot
 
@@ -30,7 +37,11 @@ DEFAULT_LOGS_DIR: Final[Path] = Path("logs")
 DEFAULT_RETAIN_FILES: Final[int] = 50
 DEFAULT_LOG_FILE_LEVEL: Final[str] = "debug"
 SRC_LOG_LEVEL: Final[str] = "SRC_LOG_LEVEL"
+SRC_LOG_VERBOSE: Final[str] = "SRC_LOG_VERBOSE"
+SRC_LOG_QUIET: Final[str] = "SRC_LOG_QUIET"
+SRC_LOG_SILENT: Final[str] = "SRC_LOG_SILENT"
 TRACE_SPAN_BYTES: Final[int] = 4
+MEBIBYTE: Final[int] = 1024 * 1024
 SECRET_FIELD_FRAGMENTS: Final[tuple[str, ...]] = (
     "api_key",
     "authorization",
@@ -50,6 +61,7 @@ LOG_FIELD_ORDER: Final[tuple[str, ...]] = (
     "logger",
     "event",
     "phase",
+    "stage",
     "message",
 )
 
@@ -73,17 +85,105 @@ class LoggingSettings:
     run: str = RUN
     retain_log_files: int = DEFAULT_RETAIN_FILES
     suppress_http_dependency_logs: bool = True
+    resource_sample_interval_seconds: float | None = None
 
 
 class LoggingConfig(Config):
     """Config fields for logging-related CLI and environment options."""
 
     src_log_level: str | None = config_field(
-        None,
+        default="INFO",
         env_var=SRC_LOG_LEVEL,
         cli_flag="--src-log-level",
         metavar="LEVEL",
-        help="Minimum level for log events (default: DEBUG; e.g. INFO hides debug events).",
+        help="Log level (default: INFO)",
+    )
+    verbose: bool = config_field(
+        default=False,
+        env_var=SRC_LOG_VERBOSE,
+        cli_flag="--verbose",
+        cli_aliases=("-v",),
+        cli_action="store_true",
+        help="Alias for --src-log-level DEBUG",
+    )
+    quiet: bool = config_field(
+        default=False,
+        env_var=SRC_LOG_QUIET,
+        cli_flag="--quiet",
+        cli_aliases=("-q",),
+        cli_action="store_true",
+        help="Alias for --src-log-level WARNING",
+    )
+    silent: bool = config_field(
+        default=False,
+        env_var=SRC_LOG_SILENT,
+        cli_flag="--silent",
+        cli_aliases=("-s",),
+        cli_action="store_true",
+        help="Alias for --src-log-level ERROR",
+    )
+
+    @model_validator(mode="after")
+    def validate_log_level_alias(self) -> Self:
+        """Require at most one alias for the terminal/log-file level."""
+        if sum((self.verbose, self.quiet, self.silent)) > 1:
+            raise ValueError("choose only one of --verbose/-v, --quiet/-q, or --silent/-s")
+        return self
+
+
+def resolve_log_level_name(
+    config: object | None = None,
+    *,
+    log_level: str | None = None,
+    verbose: bool | None = None,
+    quiet: bool | None = None,
+    silent: bool | None = None,
+) -> str | None:
+    """Resolve common CLI log-level alias to a level name.
+
+    Alias flags intentionally only map to strings. Explicit log-level
+    values are returned unchanged so `configure_logging()` owns parsing
+    and fallback behavior.
+    """
+    resolved_verbose = verbose if verbose is not None else bool(getattr(config, "verbose", False))
+    resolved_quiet = quiet if quiet is not None else bool(getattr(config, "quiet", False))
+    resolved_silent = silent if silent is not None else bool(getattr(config, "silent", False))
+    if resolved_verbose:
+        return "DEBUG"
+    if resolved_quiet:
+        return "WARNING"
+    if resolved_silent:
+        return "ERROR"
+    if log_level is not None:
+        return log_level
+    return _src_log_level_from_config(config)
+
+
+def logging_settings_from_config(
+    config: object | None = None,
+    *,
+    terminal_default: str = "INFO",
+    log_file_default: str | None = DEFAULT_LOG_FILE_LEVEL,
+    logger_name: str = "",
+    log_file: Path | None = None,
+    logs_dir: Path | None = DEFAULT_LOGS_DIR,
+    run: str = RUN,
+    retain_log_files: int = DEFAULT_RETAIN_FILES,
+    suppress_http_dependency_logs: bool = True,
+    resource_sample_interval_seconds: float | None = None,
+) -> LoggingSettings:
+    """Return `LoggingSettings` using common CLI log-level alias."""
+    explicit_level = resolve_log_level_name(config)
+    return LoggingSettings(
+        logger_name=logger_name,
+        terminal_level=explicit_level or terminal_default,
+        log_file_level=explicit_level or log_file_default,
+        log_file=log_file,
+        logs_dir=logs_dir,
+        run=run,
+        retain_log_files=retain_log_files,
+        suppress_http_dependency_logs=suppress_http_dependency_logs,
+        resource_sample_interval_seconds=resource_sample_interval_seconds,
     )
 
 
@@ -97,6 +197,116 @@ class _SpanContext:
 _SPAN_CONTEXT: contextvars.ContextVar[_SpanContext | None] = contextvars.ContextVar(
     "src_py_lib_span_context", default=None
 )
+
+_HTTP_METRICS_LOCK: Final[threading.Lock] = threading.Lock()
+_http_request_attempt_count = 0
+_http_request_bytes_total = 0
+_http_response_bytes_total = 0
+_http_retry_count = 0
+_http_2xx_count = 0
+_http_3xx_count = 0
+_http_4xx_count = 0
+_http_429_count = 0
+_http_5xx_count = 0
+_http_transport_error_count = 0
+
+
+@dataclass
+class ResourceSampler:
+    """Emit optional process resource samples and summarize usage at run end."""
+
+    interval_seconds: float
+    _stop: threading.Event = field(init=False, default_factory=threading.Event)
+    _thread: threading.Thread | None = field(init=False, default=None)
+    _started_at: float = field(init=False, default_factory=time.perf_counter)
+    _last_sample_at: float = field(init=False, default_factory=time.perf_counter)
+    _last_cpu_seconds: float = field(init=False, default=0.0)
+    _start_usage: Any = field(init=False, default=None)
+    _peak_rss_bytes: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        if self.interval_seconds < 0:
+            raise ValueError("resource_sample_interval_seconds must be >= 0")
+        self._start_usage = _resource_usage()
+        if self._start_usage is not None:
+            self._last_cpu_seconds = _cpu_seconds(self._start_usage)
+
+    def start(self) -> None:
+        """Start periodic sampling, if enabled by a positive interval."""
+        if self.interval_seconds <= 0:
+            return
+        context = contextvars.copy_context()
+        self._thread = threading.Thread(
+            target=context.run,
+            args=(self._loop,),
+            name="ResourceSampler",
+            daemon=True,
+        )
+        self._thread.start()
+        self.emit_sample()
+
+    def emit_sample(self) -> None:
+        """Emit one DEBUG `resource_sample` event."""
+        log("debug", "resource_sample", **self._sample_fields())
+
+    def stop_and_summary(self) -> dict[str, Any]:
+        """Stop periodic sampling and return run-end resource fields."""
+        if self.interval_seconds > 0:
+            self.emit_sample()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        usage = _resource_usage()
+        summary: dict[str, Any] = {
+            "cpu_count_logical": os.cpu_count() or 0,
+            "num_threads": threading.active_count(),
+        }
+        file_descriptors = _num_file_descriptors()
+        if file_descriptors is not None:
+            summary["num_fds"] = file_descriptors
+        rss_bytes = _rss_bytes(usage)
+        if rss_bytes is not None:
+            self._peak_rss_bytes = max(self._peak_rss_bytes, rss_bytes)
+        if self._peak_rss_bytes:
+            summary["peak_rss_mb"] = _bytes_to_mib(self._peak_rss_bytes)
+        if usage is not None and self._start_usage is not None:
+            summary["cpu_user_seconds"] = round(
+                float(usage.ru_utime) - float(self._start_usage.ru_utime), 3
+            )
+            summary["cpu_system_seconds"] = round(
+                float(usage.ru_stime) - float(self._start_usage.ru_stime), 3
+            )
+            summary["io_read_count"] = int(usage.ru_inblock) - int(self._start_usage.ru_inblock)
+            summary["io_write_count"] = int(usage.ru_oublock) - int(self._start_usage.ru_oublock)
+        return summary
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            self.emit_sample()
+
+    def _sample_fields(self) -> dict[str, Any]:
+        now = time.perf_counter()
+        usage = _resource_usage()
+        fields: dict[str, Any] = {
+            "num_threads": threading.active_count(),
+        }
+        rss_bytes = _rss_bytes(usage)
+        if rss_bytes is not None:
+            self._peak_rss_bytes = max(self._peak_rss_bytes, rss_bytes)
+            fields["rss_mb"] = _bytes_to_mib(rss_bytes)
+        file_descriptors = _num_file_descriptors()
+        if file_descriptors is not None:
+            fields["num_fds"] = file_descriptors
+        if usage is not None:
+            cpu_seconds = _cpu_seconds(usage)
+            elapsed = max(now - self._last_sample_at, 0.001)
+            fields["process_cpu_percent"] = round(
+                max(cpu_seconds - self._last_cpu_seconds, 0.0) / elapsed * 100.0,
+                1,
+            )
+            self._last_cpu_seconds = cpu_seconds
+        self._last_sample_at = now
+        return fields
 
 
 class _DropStructuredEvents(logging.Filter):
@@ -170,6 +380,7 @@ def configure_logging(config: LoggingSettings | None = None) -> Path | None:
     Returns the JSON log-file path when file logging is enabled.
     """
     config = config or LoggingSettings()
+    reset_observability_metrics()
     terminal_level = _log_level(config.terminal_level)
     log_file_level = _log_file_level(config.log_file_level)
     log_file = config.log_file
@@ -210,6 +421,79 @@ def configure_logging(config: LoggingSettings | None = None) -> Path | None:
     return log_file
 
 
+def reset_observability_metrics() -> None:
+    """Reset process-wide HTTP counters used by `logging_context()` run summaries."""
+    global _http_request_attempt_count, _http_request_bytes_total, _http_response_bytes_total
+    global _http_retry_count, _http_2xx_count, _http_3xx_count, _http_4xx_count
+    global _http_429_count, _http_5xx_count, _http_transport_error_count
+    with _HTTP_METRICS_LOCK:
+        _http_request_attempt_count = 0
+        _http_request_bytes_total = 0
+        _http_response_bytes_total = 0
+        _http_retry_count = 0
+        _http_2xx_count = 0
+        _http_3xx_count = 0
+        _http_4xx_count = 0
+        _http_429_count = 0
+        _http_5xx_count = 0
+        _http_transport_error_count = 0
+
+
+def record_http_attempt(
+    *,
+    request_bytes: int,
+    response_bytes: int = 0,
+    status_code: int | None = None,
+    transport_error: bool = False,
+) -> None:
+    """Record one HTTP attempt for the current run summary."""
+    global _http_request_attempt_count, _http_request_bytes_total, _http_response_bytes_total
+    global _http_2xx_count, _http_3xx_count, _http_4xx_count, _http_429_count
+    global _http_5xx_count, _http_transport_error_count
+    with _HTTP_METRICS_LOCK:
+        _http_request_attempt_count += 1
+        _http_request_bytes_total += request_bytes
+        _http_response_bytes_total += response_bytes
+        if transport_error:
+            _http_transport_error_count += 1
+        if status_code is None:
+            return
+        if 200 <= status_code < 300:
+            _http_2xx_count += 1
+        elif 300 <= status_code < 400:
+            _http_3xx_count += 1
+        elif 400 <= status_code < 500:
+            _http_4xx_count += 1
+            if status_code == 429:
+                _http_429_count += 1
+        elif status_code >= 500:
+            _http_5xx_count += 1
+
+
+def record_http_retry() -> None:
+    """Record that an HTTP attempt will be retried."""
+    global _http_retry_count
+    with _HTTP_METRICS_LOCK:
+        _http_retry_count += 1
+
+
+def observability_summary() -> dict[str, Any]:
+    """Return process-wide counters accumulated since logging was configured."""
+    with _HTTP_METRICS_LOCK:
+        return {
+            "http_request_attempt_count": _http_request_attempt_count,
+            "http_request_bytes_total": _http_request_bytes_total,
+            "http_response_bytes_total": _http_response_bytes_total,
+            "http_retry_count": _http_retry_count,
+            "http_2xx_count": _http_2xx_count,
+            "http_3xx_count": _http_3xx_count,
+            "http_4xx_count": _http_4xx_count,
+            "http_429_count": _http_429_count,
+            "http_5xx_count": _http_5xx_count,
+            "http_transport_error_count": _http_transport_error_count,
+        }
+
+
 @contextlib.contextmanager
 def logging_context(
     name: str,
@@ -217,21 +501,57 @@ def logging_context(
     *,
     git_cwd: Path | str | None = None,
     logging_config: LoggingSettings | None = None,
+    run_fields: Mapping[str, Any] | None = None,
+    run_summary: Callable[[], Mapping[str, Any]] | None = None,
 ) -> Generator[Path | None]:
     """Configure logging, install command context, and emit startup metadata."""
     resolved_logging_config = logging_config or LoggingSettings(
         log_file_level=_src_log_level_from_config(config)
     )
     log_file = configure_logging(resolved_logging_config)
+    sampler = _resource_sampler(resolved_logging_config)
+    started = time.perf_counter()
+    error: BaseException | None = None
     with log_context(command=name):
-        startup_event(
-            command=name,
-            config=config,
-            log_file=log_file,
-            git_cwd=_git_cwd_path(git_cwd),
-            logger_name=resolved_logging_config.logger_name,
-        )
-        yield log_file
+        if sampler is not None:
+            sampler.start()
+        start_fields = {"phase": "start", **dict(run_fields or {})}
+        info("run", logger_name=resolved_logging_config.logger_name, **start_fields)
+        try:
+            startup_event(
+                command=name,
+                config=config,
+                log_file=log_file,
+                git_cwd=_git_cwd_path(git_cwd),
+                logger_name=resolved_logging_config.logger_name,
+            )
+            yield log_file
+        except BaseException as exception:
+            error = exception
+            raise
+        finally:
+            error_type = _run_error_type(error)
+            summary: dict[str, Any] = {}
+            if sampler is not None:
+                summary.update(sampler.stop_and_summary())
+            summary.update(observability_summary())
+            summary["exit_code"] = _run_exit_code(error)
+            if run_summary is not None:
+                summary.update(dict(run_summary()))
+            end_fields = {
+                "phase": "end",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0),
+                "status": "error" if error_type else "ok",
+                "error_type": error_type,
+                **dict(run_fields or {}),
+                **summary,
+            }
+            log(
+                "error" if error_type else "info",
+                "run",
+                logger_name=resolved_logging_config.logger_name,
+                **end_fields,
+            )
 
 
 def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Path:
@@ -294,8 +614,21 @@ def log_context(**fields: Any) -> Generator[None]:
 
 
 @contextlib.contextmanager
+def stage(name: str, **fields: Any) -> Generator[None]:
+    """Add a workflow stage field for nested logs and structured events."""
+    with log_context(stage=name, **fields):
+        yield
+
+
+@contextlib.contextmanager
 def event(
-    key: str, *, level: str = "info", logger_name: str = "", **fields: Any
+    key: str,
+    *,
+    level: str = "info",
+    start_level: str | None = None,
+    omit_success_status: bool = False,
+    logger_name: str = "",
+    **fields: Any,
 ) -> Generator[dict[str, Any]]:
     """Emit start/end structured events around a block of work."""
     parent = _SPAN_CONTEXT.get()
@@ -306,7 +639,7 @@ def event(
     )
     reset_token = _SPAN_CONTEXT.set(span)
     try:
-        log(level, key, logger_name=logger_name, phase="start", **fields)
+        log(start_level or level, key, logger_name=logger_name, phase="start", **fields)
         started = time.perf_counter()
         extra: dict[str, Any] = {}
         error: BaseException | None = None
@@ -321,9 +654,13 @@ def event(
                 **extra,
                 "phase": "end",
                 "duration_ms": round((time.perf_counter() - started) * 1000.0),
-                "status": "error" if error else "ok",
-                "error_type": type(error).__name__ if error else None,
             }
+            if error:
+                end_fields["status"] = "error"
+                end_fields["error_type"] = type(error).__name__
+            elif not omit_success_status:
+                end_fields["status"] = "ok"
+                end_fields["error_type"] = None
             log(
                 "error" if error else level,
                 key,
@@ -332,6 +669,17 @@ def event(
             )
     finally:
         _SPAN_CONTEXT.reset(reset_token)
+
+
+def submit_with_log_context(
+    executor: Executor,
+    function: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Future[Any]:
+    """Submit work to an executor with current logging ContextVars propagated."""
+    context = contextvars.copy_context()
+    return executor.submit(context.run, function, *args, **kwargs)
 
 
 def sanitized_config_snapshot(config: object) -> dict[str, Any]:
@@ -454,13 +802,13 @@ def _log_level(value: int | str) -> int:
         return value
     normalized = value.strip().upper()
     if not normalized:
-        return logging.DEBUG
+        return logging.INFO
     if normalized.isdecimal():
         return int(normalized)
     levels = logging.getLevelNamesMapping()
     level = levels.get(normalized)
     if level is None:
-        return logging.DEBUG
+        return logging.INFO
     return level
 
 
@@ -539,6 +887,76 @@ def _secret_state(value: object) -> str:
     if value is None or value == "":
         return "missing"
     return "reference" if isinstance(value, str) and value.startswith("op://") else "provided"
+
+
+def _resource_sampler(config: LoggingSettings) -> ResourceSampler | None:
+    interval_seconds = config.resource_sample_interval_seconds
+    return ResourceSampler(interval_seconds) if interval_seconds is not None else None
+
+
+def _run_error_type(exception: BaseException | None) -> str | None:
+    if exception is None:
+        return None
+    if isinstance(exception, SystemExit) and exception.code in (None, 0):
+        return None
+    return type(exception).__name__
+
+
+def _run_exit_code(exception: BaseException | None) -> int:
+    if exception is None:
+        return 0
+    if isinstance(exception, SystemExit):
+        return exception.code if isinstance(exception.code, int) else 1
+    return 1
+
+
+def _resource_usage() -> Any | None:
+    if sys.platform == "win32":
+        return None
+    return resource.getrusage(resource.RUSAGE_SELF)
+
+
+def _cpu_seconds(usage: Any) -> float:
+    return float(usage.ru_utime) + float(usage.ru_stime)
+
+
+def _rss_bytes(usage: Any | None) -> int | None:
+    current = _linux_current_rss_bytes()
+    if current is not None:
+        return current
+    if usage is None:
+        return None
+    # Linux reports ru_maxrss in KiB; macOS reports bytes.
+    max_rss = int(usage.ru_maxrss)
+    return max_rss if sys.platform == "darwin" else max_rss * 1024
+
+
+def _linux_current_rss_bytes() -> int | None:
+    statm = Path("/proc/self/statm")
+    if not statm.exists():
+        return None
+    try:
+        fields = statm.read_text(encoding="utf-8").split()
+        if len(fields) < 2:
+            return None
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError):
+        return None
+
+
+def _num_file_descriptors() -> int | None:
+    for directory in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if not directory.exists():
+            continue
+        try:
+            return len(list(directory.iterdir()))
+        except OSError:
+            continue
+    return None
+
+
+def _bytes_to_mib(byte_count: int) -> float:
+    return round(byte_count / MEBIBYTE, 2)
 
 
 def _prune_old_log_files(logs_dir: Path, retain_files: int) -> None:

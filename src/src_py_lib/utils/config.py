@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import UnionType
-from typing import Any, Final, Union, cast, get_args, get_origin
+from typing import Any, Final, Literal, Union, cast, get_args, get_origin
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -30,8 +30,24 @@ from src_py_lib.clients.one_password import (
 )
 
 DEFAULT_CONFIG_ENV_FILE: Final[Path] = Path(".env")
+CONFIG_HELP_MIN_POSITION: Final[int] = 24
+CONFIG_HELP_MAX_POSITION_LIMIT: Final[int] = 48
+CONFIG_HELP_PADDING: Final[int] = 4
 _CONFIG_OPTION_KEY: Final[str] = "src_py_lib_config_option"
 _MISSING: Final[object] = object()
+
+
+class ConfigHelpFormatter(argparse.RawTextHelpFormatter):
+    """Help formatter for Config-backed CLIs."""
+
+    def __init__(
+        self,
+        prog: str,
+        indent_increment: int = 2,
+        max_help_position: int = CONFIG_HELP_MIN_POSITION,
+        width: int | None = None,
+    ) -> None:
+        super().__init__(prog, indent_increment, max_help_position, width)
 
 
 class ConfigError(RuntimeError):
@@ -45,6 +61,10 @@ class ConfigOption:
     field_name: str
     env_var: str
     cli_flag: str = ""
+    cli_aliases: tuple[str, ...] = ()
+    cli_action: Literal["auto", "store_true", "store_false"] = "auto"
+    cli_nargs: str | int | None = None
+    cli_const: object | None = None
     metavar: str | None = None
     help: str = ""
     secret: bool = False
@@ -58,30 +78,53 @@ class Config(BaseModel):
 
 
 def config_field(
-    default: Any = ...,
     *,
+    default: Any = ...,
     env_var: str,
     cli_flag: str | None = None,
+    cli_aliases: Sequence[str] = (),
+    cli_action: Literal["auto", "store_true", "store_false"] = "auto",
+    cli_nargs: str | int | None = None,
+    cli_const: object | None = None,
     metavar: str | None = None,
     help: str = "",
     secret: bool = False,
     required: bool = False,
+    gt: int | float | None = None,
+    ge: int | float | None = None,
+    lt: int | float | None = None,
+    le: int | float | None = None,
+    pattern: str | None = None,
 ) -> Any:
     """Return a Pydantic field with Config environment and CLI metadata."""
     option = ConfigOption(
         field_name="",
         env_var=env_var,
         cli_flag=cli_flag or "",
+        cli_aliases=tuple(cli_aliases),
+        cli_action=cli_action,
+        cli_nargs=cli_nargs,
+        cli_const=cli_const,
         metavar=metavar,
         help=help,
         secret=secret,
         required=required,
     )
-    return Field(
-        default,
-        description=help or None,
-        json_schema_extra=_config_json_schema_extra(option),
-    )
+    field_kwargs: dict[str, Any] = {
+        "description": help or None,
+        "json_schema_extra": _config_json_schema_extra(option),
+    }
+    if gt is not None:
+        field_kwargs["gt"] = gt
+    if ge is not None:
+        field_kwargs["ge"] = ge
+    if lt is not None:
+        field_kwargs["lt"] = lt
+    if le is not None:
+        field_kwargs["le"] = le
+    if pattern is not None:
+        field_kwargs["pattern"] = pattern
+    return Field(default, **field_kwargs)
 
 
 def config_options(config_cls: type[Config]) -> tuple[ConfigOption, ...]:
@@ -150,7 +193,7 @@ def add_config_arguments(
     """Add Config CLI flags to an argparse parser."""
     group = parser.add_argument_group(
         "Config",
-        "These options override matching environment variables and .env values.",
+        "These options override matching environment variables and .env values",
     )
     if include_env_file:
         group.add_argument(
@@ -158,27 +201,28 @@ def add_config_arguments(
             dest="env_file",
             default=None,
             metavar="PATH",
-            help="Read Config .env values from PATH (default: .env).",
+            help="Read Config .env values from PATH (default: .env)",
         )
 
     for option in config_options(config_cls):
         field_info = config_cls.model_fields[option.field_name]
+        argument_kwargs: dict[str, Any] = {
+            "dest": option.field_name,
+            "default": None,
+            "help": option.help,
+        }
+        if option.metavar is not None:
+            argument_kwargs["metavar"] = option.metavar
+        if option.cli_nargs is not None:
+            argument_kwargs["nargs"] = option.cli_nargs
+        if option.cli_const is not None:
+            argument_kwargs["const"] = option.cli_const
         if _is_bool_annotation(field_info.annotation):
-            group.add_argument(
-                option.cli_flag,
-                dest=option.field_name,
-                action=argparse.BooleanOptionalAction,
-                default=None,
-                help=option.help,
-            )
-        else:
-            group.add_argument(
-                option.cli_flag,
-                dest=option.field_name,
-                default=None,
-                metavar=option.metavar,
-                help=option.help,
-            )
+            if option.cli_action == "auto":
+                argument_kwargs["action"] = argparse.BooleanOptionalAction
+            else:
+                argument_kwargs["action"] = option.cli_action
+        group.add_argument(option.cli_flag, *option.cli_aliases, **argument_kwargs)
 
 
 def config_parse_args[ConfigT: Config](
@@ -195,7 +239,11 @@ def config_parse_args[ConfigT: Config](
     require: Iterable[str] = (),
 ) -> ConfigT:
     """Parse Config CLI flags and return a validated Config model."""
-    argument_parser = parser or argparse.ArgumentParser(description=description)
+    max_help_position = _config_help_max_position(config_cls, include_env_file=include_env_file)
+    argument_parser = parser or argparse.ArgumentParser(
+        description=description,
+        formatter_class=_config_help_formatter(max_help_position),
+    )
     add_config_arguments(argument_parser, config_cls, include_env_file=include_env_file)
     args = argument_parser.parse_args(argv)
     try:
@@ -210,6 +258,77 @@ def config_parse_args[ConfigT: Config](
         )
     except ConfigError as exception:
         argument_parser.error(str(exception))
+
+
+def _config_help_formatter(max_help_position: int) -> type[argparse.HelpFormatter]:
+    """Return a formatter class with this parser's computed help position."""
+
+    class DynamicConfigHelpFormatter(ConfigHelpFormatter):
+        def __init__(self, prog: str) -> None:
+            super().__init__(prog, max_help_position=max_help_position)
+
+    return DynamicConfigHelpFormatter
+
+
+def _config_help_max_position(
+    config_cls: type[Config],
+    *,
+    include_env_file: bool,
+) -> int:
+    """Return help-column width based on this Config's CLI arguments."""
+    invocation_lengths = [len("--env-file PATH")] if include_env_file else []
+    invocation_lengths.extend(
+        _config_option_invocation_length(config_cls, option)
+        for option in config_options(config_cls)
+    )
+    longest_invocation = max(invocation_lengths, default=0)
+    return min(
+        max(CONFIG_HELP_MIN_POSITION, longest_invocation + CONFIG_HELP_PADDING),
+        CONFIG_HELP_MAX_POSITION_LIMIT,
+    )
+
+
+def _config_option_invocation_length(config_cls: type[Config], option: ConfigOption) -> int:
+    """Return argparse-style option invocation length for help alignment."""
+    field_info = config_cls.model_fields[option.field_name]
+    option_strings = _config_option_strings(option, field_info)
+    if _config_option_takes_value(option, field_info):
+        arguments = _config_option_arguments(option)
+        return len(", ".join(f"{option_string} {arguments}" for option_string in option_strings))
+    return len(", ".join(option_strings))
+
+
+def _config_option_strings(option: ConfigOption, field_info: FieldInfo) -> tuple[str, ...]:
+    """Return option strings as argparse will display them."""
+    if _is_bool_annotation(field_info.annotation) and option.cli_action == "auto":
+        long_options = tuple(
+            f"--no-{option_string.removeprefix('--')}"
+            for option_string in (option.cli_flag, *option.cli_aliases)
+            if option_string.startswith("--")
+        )
+        return (option.cli_flag, *long_options, *option.cli_aliases)
+    return (option.cli_flag, *option.cli_aliases)
+
+
+def _config_option_takes_value(option: ConfigOption, field_info: FieldInfo) -> bool:
+    """Return whether argparse displays a value placeholder for this option."""
+    if not _is_bool_annotation(field_info.annotation):
+        return True
+    return option.cli_action == "auto" and option.cli_nargs is not None
+
+
+def _config_option_arguments(option: ConfigOption) -> str:
+    """Return the argparse-style value placeholder for this option."""
+    metavar = option.metavar or option.field_name.upper()
+    if option.cli_nargs == "?":
+        return f"[{metavar}]"
+    if option.cli_nargs == "*":
+        return f"[{metavar} ...]"
+    if option.cli_nargs == "+":
+        return f"{metavar} [{metavar} ...]"
+    if isinstance(option.cli_nargs, int):
+        return " ".join(metavar for _ in range(option.cli_nargs))
+    return metavar
 
 
 def config_overrides_from_args(
@@ -320,10 +439,14 @@ def _config_option_from_field(field_name: str, field_info: FieldInfo) -> ConfigO
     )
 
 
-def _config_option_payload(option: ConfigOption) -> dict[str, str | bool | None]:
+def _config_option_payload(option: ConfigOption) -> dict[str, object]:
     return {
         "env_var": option.env_var,
         "cli_flag": option.cli_flag,
+        "cli_aliases": list(option.cli_aliases),
+        "cli_action": option.cli_action,
+        "cli_nargs": option.cli_nargs,
+        "cli_const": option.cli_const,
         "metavar": option.metavar,
         "help": option.help,
         "secret": option.secret,
@@ -340,17 +463,36 @@ def _config_option_from_payload(payload: Mapping[str, object]) -> ConfigOption |
     if not isinstance(env_var, str) or not env_var:
         return None
     cli_flag = payload.get("cli_flag")
+    cli_aliases = payload.get("cli_aliases")
+    cli_action = payload.get("cli_action")
+    cli_nargs = payload.get("cli_nargs")
     metavar = payload.get("metavar")
     help_text = payload.get("help")
     return ConfigOption(
         field_name="",
         env_var=env_var,
         cli_flag=cli_flag if isinstance(cli_flag, str) else "",
+        cli_aliases=_string_tuple(cli_aliases),
+        cli_action=_cli_action(cli_action),
+        cli_nargs=cli_nargs if isinstance(cli_nargs, str | int) else None,
+        cli_const=payload.get("cli_const"),
         metavar=metavar if isinstance(metavar, str) else None,
         help=help_text if isinstance(help_text, str) else "",
         secret=payload.get("secret") is True,
         required=payload.get("required") is True,
     )
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    return tuple(item for item in cast(Sequence[object], value) if isinstance(item, str))
+
+
+def _cli_action(value: object) -> Literal["auto", "store_true", "store_false"]:
+    if value in {"store_true", "store_false"}:
+        return cast(Literal["store_true", "store_false"], value)
+    return "auto"
 
 
 def _selected_raw_value(
