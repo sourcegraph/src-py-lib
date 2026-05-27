@@ -27,11 +27,11 @@ class SlackClientConfig(Config):
     """Config fields needed to build a Slack API client."""
 
     slack_bot_token: str = config_field(
-        "",
+        default="",
         env_var="SLACK_BOT_TOKEN",
         cli_flag="--slack-bot-token",
         metavar="TOKEN",
-        help="Slack bot token or op:// secret reference.",
+        help="Slack bot token or op:// secret reference",
         secret=True,
         required=True,
     )

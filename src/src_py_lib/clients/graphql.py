@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -113,6 +113,17 @@ fragment TypeRef on __Type {
 class GraphQLError(RuntimeError):
     """Raised for GraphQL transport or application errors."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        is_application_error: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.is_application_error = is_application_error
+
 
 @dataclass
 class GraphQLClient:
@@ -174,6 +185,49 @@ class GraphQLClient:
             )
         return data
 
+    def stream_connection_nodes(
+        self,
+        query: str,
+        variables: Mapping[str, JSONValue] | None = None,
+        *,
+        connection_path: Sequence[str],
+        page_size: int | None = None,
+        first_variable: str = "first",
+        after_variable: str = "after",
+    ) -> Iterator[JSONDict]:
+        """Stream one GraphQL connection's nodes page by page.
+
+        `connection_path` is the response path to the connection object that
+        contains `nodes` and `pageInfo`, for example `("viewer", "items")`.
+        Unlike `execute(..., follow_pages=True)`, this does not accumulate all
+        nodes in memory before returning.
+        """
+        page_number = 1
+
+        def execute_page(
+            operation: str, page_variables: Mapping[str, JSONValue] | None
+        ) -> JSONDict:
+            nonlocal page_number
+            data = self._execute_once(
+                operation,
+                dict(page_variables or {}),
+                page_number=page_number,
+                first_variable=first_variable,
+                after_variable=after_variable,
+            )
+            page_number += 1
+            return data
+
+        yield from stream_connection_nodes(
+            execute_page,
+            query,
+            variables,
+            connection_path=connection_path,
+            page_size=page_size,
+            first_variable=first_variable,
+            after_variable=after_variable,
+        )
+
     def _execute_once(
         self,
         query: str,
@@ -200,7 +254,8 @@ class GraphQLClient:
                 payload = self.http.json("POST", self.url, headers=self.headers, json_body=body)
             except HTTPClientError as exception:
                 raise GraphQLError(
-                    f"{self.label} GraphQL request failed: {exception}"
+                    f"{self.label} GraphQL request failed: {exception}",
+                    status_code=exception.status_code,
                 ) from exception
             errors = payload.get("errors")
             data = json_dict(payload.get("data"))
@@ -208,7 +263,10 @@ class GraphQLClient:
             if errors:
                 fields["graphql_errors"] = len(errors) if isinstance(errors, list) else 1
             if errors and not (self.tolerate_partial_errors and data):
-                raise GraphQLError(f"{self.label} GraphQL errors: {errors}")
+                raise GraphQLError(
+                    f"{self.label} GraphQL errors: {errors}",
+                    is_application_error=True,
+                )
             return data
 
 
@@ -216,6 +274,49 @@ def operation_name(query: str) -> str:
     """Extract the operation name from a GraphQL document."""
     match = _OPERATION_NAME_RE.search(query)
     return match.group(1) if match else "anonymous"
+
+
+def stream_connection_nodes(
+    execute: Callable[[str, Mapping[str, JSONValue] | None], JSONDict],
+    query: str,
+    variables: Mapping[str, JSONValue] | None = None,
+    *,
+    connection_path: Sequence[str],
+    page_size: int | None = None,
+    first_variable: str = "first",
+    after_variable: str = "after",
+) -> Iterator[JSONDict]:
+    """Stream one GraphQL connection's nodes through any execute callable."""
+    page_variables: JSONDict = dict(variables) if variables is not None else {}
+    if page_size is not None:
+        page_variables[first_variable] = page_size
+    query_uses_after_variable = _query_uses_variable(query, after_variable)
+    if query_uses_after_variable and after_variable not in page_variables:
+        page_variables[after_variable] = None
+
+    path = tuple(connection_path)
+    current_cursor = page_variables.get(after_variable)
+    while True:
+        data = execute(query, dict(page_variables))
+        page = _node_page_at_path(data, path)
+        for node in json_list(page.get("nodes")):
+            yield json_dict(node)
+
+        page_info = json_dict(page.get("pageInfo"))
+        has_next_page = page_info.get("hasNextPage")
+        if not isinstance(has_next_page, bool):
+            raise GraphQLError(
+                f"GraphQL pagination path {_path_label(path)} missing pageInfo.hasNextPage"
+            )
+        if not has_next_page:
+            return
+        if not query_uses_after_variable:
+            raise GraphQLError(
+                f"GraphQL query returned more pages but does not use ${after_variable}"
+            )
+        next_cursor = _next_page_cursor(page_info, path, current_cursor)
+        page_variables[after_variable] = next_cursor
+        current_cursor = next_cursor
 
 
 def _int_variable(variables: JSONDict, name: str) -> int | None:
@@ -301,9 +402,7 @@ def _fetch_remaining_pages(
     target_page = _node_page_at_path(data, path)
     target_nodes = json_list(target_page.get("nodes"))
     page_info = json_dict(target_page.get("pageInfo"))
-    after = json_str(page_info, "endCursor")
-    if not after:
-        raise GraphQLError(f"GraphQL pagination path {'.'.join(path)} missing pageInfo.endCursor")
+    after = _next_page_cursor(page_info, path, variables.get(after_variable))
 
     while after:
         page_variables = dict(variables)
@@ -322,11 +421,7 @@ def _fetch_remaining_pages(
             )
         if not has_next_page:
             return
-        after = json_str(next_page_info, "endCursor")
-        if not after:
-            raise GraphQLError(
-                f"GraphQL pagination path {'.'.join(path)} missing pageInfo.endCursor"
-            )
+        after = _next_page_cursor(next_page_info, path, after)
 
 
 def _next_page_paths(data: JSONDict) -> list[tuple[str, ...]]:
@@ -355,9 +450,26 @@ def _node_page_at_path(data: JSONDict, path: tuple[str, ...]) -> JSONDict:
         current = json_dict(current).get(key)
     page = json_dict(current)
     if not page:
-        label = ".".join(path) or "<root>"
-        raise GraphQLError(f"GraphQL response did not include pagination path {label}")
+        raise GraphQLError(f"GraphQL response did not include pagination path {_path_label(path)}")
     return page
+
+
+def _next_page_cursor(page_info: JSONDict, path: tuple[str, ...], current_cursor: object) -> str:
+    next_cursor = json_str(page_info, "endCursor")
+    if not next_cursor:
+        raise GraphQLError(
+            f"GraphQL pagination path {_path_label(path)} missing pageInfo.endCursor"
+        )
+    if isinstance(current_cursor, str) and next_cursor == current_cursor:
+        raise GraphQLError(
+            f"GraphQL pagination path {_path_label(path)} stalled: "
+            f"pageInfo.endCursor did not advance from {current_cursor!r}"
+        )
+    return next_cursor
+
+
+def _path_label(path: tuple[str, ...]) -> str:
+    return ".".join(path) or "<root>"
 
 
 def _query_uses_variable(query: str, variable: str) -> bool:

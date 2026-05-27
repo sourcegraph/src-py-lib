@@ -49,11 +49,11 @@ class LinearClientConfig(Config):
     """Config fields needed to build a Linear API client."""
 
     linear_api_token: str = config_field(
-        "",
+        default="",
         env_var="LINEAR_API_TOKEN",
         cli_flag="--linear-api-token",
         metavar="TOKEN",
-        help="Linear API token or op:// secret reference.",
+        help="Linear API token or op:// secret reference",
         secret=True,
         required=True,
     )

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import Any
 
 from src_py_lib.clients.github import GitHubClient, PullRequest, gh_cli_token, pr_ref_from_url
 from src_py_lib.clients.google_sheets import (
@@ -18,6 +20,7 @@ from src_py_lib.clients.graphql import (
     GraphQLError,
     aliased_batched_query,
     introspect_schema,
+    stream_connection_nodes,
 )
 from src_py_lib.clients.linear import (
     LinearClient,
@@ -30,6 +33,12 @@ from src_py_lib.clients.slack import (
     SlackError,
     SlackPacer,
     slack_client_from_config,
+)
+from src_py_lib.clients.sourcegraph import (
+    SourcegraphClient,
+    SourcegraphClientConfig,
+    normalize_sourcegraph_endpoint,
+    sourcegraph_client_from_config,
 )
 from src_py_lib.utils.config import (
     Config,
@@ -63,7 +72,11 @@ from src_py_lib.utils.logging import (
     log,
     log_context,
     logging_context,
+    logging_settings_from_config,
+    resolve_log_level_name,
+    stage,
     startup_event,
+    submit_with_log_context,
     warning,
 )
 from src_py_lib.utils.tsv import write_tsv
@@ -75,6 +88,8 @@ def logging(
     command: str | None = None,
     git_cwd: Path | str | None = None,
     logging_config: LoggingSettings | None = None,
+    run_fields: Mapping[str, Any] | None = None,
+    run_summary: Callable[[], Mapping[str, Any]] | None = None,
 ) -> AbstractContextManager[Path | None]:
     """Configure standard CLI logging and emit startup metadata."""
     return logging_context(
@@ -82,6 +97,8 @@ def logging(
         config,
         git_cwd=git_cwd,
         logging_config=logging_config,
+        run_fields=run_fields,
+        run_summary=run_summary,
     )
 
 
@@ -109,6 +126,8 @@ __all__ = [
     "SlackClientConfig",
     "SlackError",
     "SlackPacer",
+    "SourcegraphClient",
+    "SourcegraphClientConfig",
     "aliased_batched_query",
     "config_field",
     "config_snapshot",
@@ -131,14 +150,21 @@ __all__ = [
     "load_json_cache",
     "load_json_subset",
     "logging",
+    "logging_settings_from_config",
     "log",
     "log_context",
+    "normalize_sourcegraph_endpoint",
     "parse_args",
     "pr_ref_from_url",
     "quota_project_from_adc",
+    "resolve_log_level_name",
     "save_json_cache",
     "slack_client_from_config",
+    "sourcegraph_client_from_config",
+    "stage",
     "startup_event",
+    "stream_connection_nodes",
+    "submit_with_log_context",
     "warning",
     "write_tsv",
 ]

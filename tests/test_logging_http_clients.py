@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from collections.abc import Mapping
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -20,7 +20,12 @@ import httpx
 import src_py_lib as src
 from src_py_lib.clients.github import GitHubClient, graphql_api_url, pr_ref_from_url
 from src_py_lib.clients.google_sheets import GoogleSheetsClient
-from src_py_lib.clients.graphql import GraphQLClient, GraphQLError, introspect_schema
+from src_py_lib.clients.graphql import (
+    GraphQLClient,
+    GraphQLError,
+    introspect_schema,
+    stream_connection_nodes,
+)
 from src_py_lib.clients.linear import LinearClient, LinearClientConfig, linear_client_from_config
 from src_py_lib.clients.one_password import (
     OnePasswordClient,
@@ -31,6 +36,7 @@ from src_py_lib.clients.slack import SlackClient
 from src_py_lib.clients.sourcegraph import (
     SourcegraphClient,
     SourcegraphClientConfig,
+    normalize_sourcegraph_endpoint,
     sourcegraph_client_from_config,
 )
 from src_py_lib.utils.config import (
@@ -61,6 +67,8 @@ from src_py_lib.utils.logging import (
     info,
     log,
     log_context,
+    logging_settings_from_config,
+    resolve_log_level_name,
     startup_event,
     warning,
 )
@@ -116,39 +124,39 @@ class ExampleConfig(Config):
     """Config model used by Config tests."""
 
     token: str = config_field(
-        "",
+        default="",
         env_var="EXAMPLE_TOKEN",
         cli_flag="--token",
         metavar="TOKEN",
-        help="Example token.",
+        help="Example token",
         secret=True,
     )
     page_size: int = config_field(
-        25,
+        default=25,
         env_var="EXAMPLE_PAGE_SIZE",
         cli_flag="--page-size",
         metavar="N",
-        help="Example page size.",
+        help="Example page size",
     )
     include_archived: bool = config_field(
-        False,
+        default=False,
         env_var="EXAMPLE_INCLUDE_ARCHIVED",
         cli_flag="--include-archived",
-        help="Include archived examples.",
+        help="Include archived examples",
     )
     output_dir: Path = config_field(
-        Path("out"),
+        default=Path("out"),
         env_var="EXAMPLE_OUTPUT_DIR",
         cli_flag="--output-dir",
         metavar="PATH",
-        help="Example output directory.",
+        help="Example output directory",
     )
     labels: tuple[str, ...] = config_field(
-        (),
+        default=(),
         env_var="EXAMPLE_LABELS",
         cli_flag="--labels",
         metavar="CSV",
-        help="Example labels.",
+        help="Example labels",
     )
 
 
@@ -156,39 +164,108 @@ class RequiredConfig(Config):
     """Config model with a required secret field."""
 
     token: str = config_field(
-        "",
+        default="",
         env_var="REQUIRED_TOKEN",
         cli_flag="--token",
         metavar="TOKEN",
-        help="Required token.",
+        help="Required token",
         secret=True,
         required=True,
     )
     name: str = config_field(
-        "",
+        default="",
         env_var="REQUIRED_NAME",
         cli_flag="--name",
         metavar="NAME",
-        help="Non-secret required config name.",
+        help="Non-secret required config name",
+    )
+
+
+class MultilineHelpConfig(Config):
+    """Config model with multiline CLI help text."""
+
+    notes: str = config_field(
+        default="",
+        env_var="MULTILINE_HELP_NOTES",
+        cli_flag="--notes",
+        metavar="TEXT",
+        help="First line.\nSecond line.\n  Indented detail.",
     )
 
 
 class SnapshotOrderConfig(Config):
     """Config model whose field names and env-var names sort differently."""
 
-    alpha: str = config_field("a", env_var="ZZZ_ALPHA")
-    zulu: str = config_field("z", env_var="AAA_ZULU")
+    alpha: str = config_field(default="a", env_var="ZZZ_ALPHA")
+    zulu: str = config_field(default="z", env_var="AAA_ZULU")
+
+
+class BoundedConfig(Config):
+    """Config model with numeric bounds."""
+
+    page_size: int = config_field(
+        default=25,
+        env_var="BOUNDED_PAGE_SIZE",
+        cli_flag="--page-size",
+        metavar="N",
+        ge=1,
+    )
+    sample_interval: float = config_field(
+        default=10.0,
+        env_var="BOUNDED_SAMPLE_INTERVAL",
+        cli_flag="--sample-interval",
+        metavar="SECS",
+        ge=0,
+    )
+
+
+class PatternConfig(Config):
+    """Config model with a string pattern constraint."""
+
+    date: str | None = config_field(
+        default=None,
+        env_var="PATTERN_DATE",
+        cli_flag="--date",
+        metavar="YYYY-MM-DD",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+
+
+class CommandStyleConfig(Config):
+    """Config model with command-style flags."""
+
+    get: bool = config_field(
+        default=False,
+        env_var="COMMAND_STYLE_GET",
+        cli_flag="--get",
+        cli_action="store_true",
+    )
+    verbose: bool = config_field(
+        default=False,
+        env_var="COMMAND_STYLE_VERBOSE",
+        cli_flag="--verbose",
+        cli_aliases=("-v",),
+        cli_action="store_true",
+    )
+    schema_path: Path | None = config_field(
+        default=None,
+        env_var="COMMAND_STYLE_SCHEMA_PATH",
+        cli_flag="--get-schema",
+        cli_nargs="?",
+        cli_const="schema.gql",
+        metavar="FILE",
+    )
 
 
 class LinearExampleConfig(LinearClientConfig):
     """Config model composed from Linear client fields and app fields."""
 
     page_size: int = config_field(
-        25,
+        default=25,
         env_var="LINEAR_EXAMPLE_PAGE_SIZE",
         cli_flag="--page-size",
         metavar="N",
-        help="Example page size.",
+        help="Example page size",
     )
 
 
@@ -196,11 +273,11 @@ class SourcegraphExampleConfig(SourcegraphClientConfig):
     """Config model composed from Sourcegraph client fields and app fields."""
 
     repo_query: str = config_field(
-        "",
+        default="",
         env_var="SOURCEGRAPH_EXAMPLE_REPO_QUERY",
         cli_flag="--repo-query",
         metavar="QUERY",
-        help="Example Sourcegraph repository query.",
+        help="Example Sourcegraph repository query",
     )
 
 
@@ -374,10 +451,84 @@ class ConfigTest(unittest.TestCase):
             },
         )
 
+    def test_config_arguments_support_aliases_actions_and_optional_values(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_config_arguments(parser, CommandStyleConfig)
+
+        default_schema_args = parser.parse_args(["--get", "-v", "--get-schema"])
+        named_schema_args = parser.parse_args(["--get-schema", "custom.gql"])
+
+        default_schema_config = load_config_from_args(
+            CommandStyleConfig,
+            default_schema_args,
+            env={},
+            resolve_op_refs=False,
+        )
+        named_schema_config = load_config_from_args(
+            CommandStyleConfig,
+            named_schema_args,
+            env={},
+            resolve_op_refs=False,
+        )
+
+        self.assertTrue(default_schema_config.get)
+        self.assertTrue(default_schema_config.verbose)
+        self.assertEqual(default_schema_config.schema_path, Path.cwd() / "schema.gql")
+        self.assertEqual(named_schema_config.schema_path, Path.cwd() / "custom.gql")
+
+    def test_config_field_supports_numeric_bounds(self) -> None:
+        config = load_config(
+            BoundedConfig,
+            env_file=None,
+            env={"BOUNDED_PAGE_SIZE": "1", "BOUNDED_SAMPLE_INTERVAL": "0"},
+            resolve_op_refs=False,
+        )
+
+        self.assertEqual(config.page_size, 1)
+        self.assertEqual(config.sample_interval, 0)
+        with self.assertRaisesRegex(ConfigError, "greater than or equal to 1"):
+            load_config(
+                BoundedConfig,
+                env_file=None,
+                env={"BOUNDED_PAGE_SIZE": "0"},
+                resolve_op_refs=False,
+            )
+        with self.assertRaisesRegex(ConfigError, "greater than or equal to 0"):
+            load_config(
+                BoundedConfig,
+                env_file=None,
+                env={"BOUNDED_SAMPLE_INTERVAL": "-0.1"},
+                resolve_op_refs=False,
+            )
+
+    def test_config_field_supports_string_pattern(self) -> None:
+        config = load_config(
+            PatternConfig,
+            env_file=None,
+            env={"PATTERN_DATE": "2026-01-31"},
+            resolve_op_refs=False,
+        )
+
+        self.assertEqual(config.date, "2026-01-31")
+        with self.assertRaisesRegex(ConfigError, "String should match pattern"):
+            load_config(
+                PatternConfig,
+                env_file=None,
+                env={"PATTERN_DATE": "2026-1-31"},
+                resolve_op_refs=False,
+            )
+        with self.assertRaisesRegex(ConfigError, "String should match pattern"):
+            load_config(
+                PatternConfig,
+                env_file=None,
+                env={"PATTERN_DATE": "2026-01-31T00:00:00Z"},
+                resolve_op_refs=False,
+            )
+
     def test_logging_config_mixin_adds_log_level_from_cli_and_env(self) -> None:
         parser = argparse.ArgumentParser()
         add_config_arguments(parser, LoggingExampleConfig)
-        args = parser.parse_args(["--src-log-level", "INFO"])
+        args = parser.parse_args(["--src-log-level", "INFO", "-v"])
 
         cli_config = load_config_from_args(
             LoggingExampleConfig,
@@ -393,7 +544,62 @@ class ConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(cli_config.src_log_level, "INFO")
+        self.assertTrue(cli_config.verbose)
         self.assertEqual(env_config.src_log_level, "ERROR")
+
+    def test_logging_config_rejects_multiple_log_level_alias(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "choose only one of --verbose"):
+            load_config(
+                LoggingExampleConfig,
+                env_file=None,
+                env={"SRC_LOG_VERBOSE": "true", "SRC_LOG_QUIET": "true"},
+                resolve_op_refs=False,
+            )
+
+    def test_resolve_log_level_name_maps_cli_alias(self) -> None:
+        self.assertEqual(resolve_log_level_name(verbose=True), "DEBUG")
+        self.assertEqual(resolve_log_level_name(quiet=True), "WARNING")
+        self.assertEqual(resolve_log_level_name(silent=True), "ERROR")
+        self.assertEqual(resolve_log_level_name(log_level="trace"), "trace")
+        self.assertIsNone(resolve_log_level_name(object()))
+
+        config = LoggingExampleConfig(src_log_level="INFO")
+        self.assertEqual(resolve_log_level_name(config), "INFO")
+        verbose_config = LoggingExampleConfig(src_log_level="INFO", verbose=True)
+        self.assertEqual(resolve_log_level_name(verbose_config), "DEBUG")
+        quiet_config = config_parse_args(
+            LoggingExampleConfig,
+            argv=["-q"],
+            env={},
+            resolve_op_refs=False,
+        )
+        self.assertEqual(resolve_log_level_name(quiet_config), "WARNING")
+        env_config = load_config(
+            LoggingExampleConfig,
+            env_file=None,
+            env={"SRC_LOG_SILENT": "true"},
+            resolve_op_refs=False,
+        )
+        self.assertTrue(env_config.silent)
+        self.assertEqual(resolve_log_level_name(env_config), "ERROR")
+
+    def test_logging_settings_from_config_maps_common_cli_levels(self) -> None:
+        default_settings = logging_settings_from_config(
+            resource_sample_interval_seconds=2.5,
+        )
+        self.assertEqual(default_settings.terminal_level, "INFO")
+        self.assertEqual(default_settings.log_file_level, "debug")
+        self.assertEqual(default_settings.resource_sample_interval_seconds, 2.5)
+
+        quiet_config = LoggingExampleConfig(src_log_level="INFO", quiet=True)
+        quiet_settings = logging_settings_from_config(quiet_config)
+        self.assertEqual(quiet_settings.terminal_level, "WARNING")
+        self.assertEqual(quiet_settings.log_file_level, "WARNING")
+
+        log_level_config = LoggingExampleConfig(src_log_level="ERROR")
+        log_level_settings = logging_settings_from_config(log_level_config)
+        self.assertEqual(log_level_settings.terminal_level, "ERROR")
+        self.assertEqual(log_level_settings.log_file_level, "ERROR")
 
     def test_config_parse_args_loads_config_and_reports_config_errors(self) -> None:
         config = config_parse_args(
@@ -413,6 +619,61 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("REQUIRED_TOKEN", stderr.getvalue())
+
+    def test_config_parse_args_preserves_description_newlines_in_help(self) -> None:
+        description = "Example CLI.\n\nSteps:\n  1. Collect data.\n  2. Export data."
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            config_parse_args(
+                ExampleConfig,
+                argv=["--help"],
+                description=description,
+                env={},
+                resolve_op_refs=False,
+            )
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn(description, stdout.getvalue())
+
+    def test_config_parse_args_keeps_long_options_on_help_line(self) -> None:
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            config_parse_args(
+                SourcegraphExampleConfig,
+                argv=["--help"],
+                env={},
+                resolve_op_refs=False,
+            )
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = stdout.getvalue()
+        self.assertNotIn("--src-access-token TOKEN\n", help_text)
+        self.assertRegex(help_text, r"--src-access-token TOKEN +Sourcegraph access token")
+
+    def test_config_parse_args_preserves_argument_help_newlines(self) -> None:
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            config_parse_args(
+                MultilineHelpConfig,
+                argv=["--help"],
+                env={},
+                resolve_op_refs=False,
+            )
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = stdout.getvalue()
+        self.assertIn("First line.\n", help_text)
+        self.assertRegex(help_text, r"\n +Second line\.\n")
+        self.assertRegex(help_text, r"\n +  Indented detail\.")
+
+    def test_config_field_requires_named_default(self) -> None:
+        config_field_any: Any = config_field
+
+        with self.assertRaises(TypeError):
+            config_field_any("", env_var="POSITIONAL_DEFAULT")
 
     def test_required_values_and_reference_resolution(self) -> None:
         with self.assertRaisesRegex(ConfigError, "REQUIRED_TOKEN"):
@@ -559,7 +820,7 @@ class LoggingTest(unittest.TestCase):
                 )
             )
             try:
-                log("bogus", "fallback_debug", logger_name=logger_name)
+                log("bogus", "fallback_info", logger_name=logger_name)
                 warning("warning_event", logger_name=logger_name)
                 error("error_event", logger_name=logger_name)
                 critical("critical_event", logger_name=logger_name)
@@ -571,7 +832,7 @@ class LoggingTest(unittest.TestCase):
 
             rows = [json.loads(line) for line in log_file.read_text().splitlines()]
             levels = {row["event"]: row["level"] for row in rows}
-            self.assertEqual(levels["fallback_debug"], "DEBUG")
+            self.assertEqual(levels["fallback_info"], "INFO")
             self.assertEqual(levels["warning_event"], "WARNING")
             self.assertEqual(levels["error_event"], "ERROR")
             self.assertEqual(levels["critical_event"], "CRITICAL")
@@ -757,6 +1018,129 @@ class LoggingTest(unittest.TestCase):
             self.assertEqual(inner_log["trace"], outer_start["trace"])
             self.assertEqual(inner_log["span"], inner_start["span"])
             self.assertEqual(inner_log["parent_span"], outer_start["span"])
+
+    def test_event_can_lower_start_level_and_omit_success_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            logger_name = "src_py_lib_test_quiet_event"
+            configure_logging(
+                LoggingSettings(
+                    logger_name=logger_name,
+                    terminal_level="critical",
+                    log_file_level="info",
+                    log_file=log_file,
+                    run="test-run",
+                )
+            )
+            try:
+                with event(
+                    "quiet_start",
+                    logger_name=logger_name,
+                    level="info",
+                    start_level="debug",
+                    omit_success_status=True,
+                ):
+                    pass
+            finally:
+                logger = logging.getLogger(logger_name)
+                for handler in list(logger.handlers):
+                    logger.removeHandler(handler)
+                    handler.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            quiet_rows = [row for row in rows if row["event"] == "quiet_start"]
+            self.assertEqual(len(quiet_rows), 1)
+            self.assertEqual(quiet_rows[0]["phase"], "end")
+            self.assertNotIn("status", quiet_rows[0])
+            self.assertNotIn("error_type", quiet_rows[0])
+
+    def test_logging_context_emits_run_summary_resource_and_http_metrics(self) -> None:
+        attempts = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(429, json={"retry": True}, headers={"Retry-After": "0"})
+            return httpx.Response(200, json={"ok": True})
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            try:
+                with src.logging(
+                    command="unit-test",
+                    logging_config=LoggingSettings(
+                        terminal_level="critical",
+                        log_file_level="debug",
+                        log_file=log_file,
+                        run="test-run",
+                        resource_sample_interval_seconds=0,
+                    ),
+                    run_fields={"endpoint": "https://example.com"},
+                    run_summary=lambda: {"custom_count": 7},
+                ):
+                    client = HTTPClient(
+                        max_attempts=2,
+                        retry_base_delay_seconds=0,
+                        retry_max_delay_seconds=0,
+                        transport=httpx.MockTransport(handler),
+                    )
+                    self.assertEqual(
+                        client.json(
+                            "POST",
+                            "https://example.com/api",
+                            json_body={"hello": "world"},
+                        ),
+                        {"ok": True},
+                    )
+            finally:
+                logger = logging.getLogger("")
+                for handler_ in list(logger.handlers):
+                    logger.removeHandler(handler_)
+                    handler_.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            run_end = next(row for row in rows if row["event"] == "run" and row["phase"] == "end")
+            self.assertEqual(run_end["status"], "ok")
+            self.assertEqual(run_end["exit_code"], 0)
+            self.assertEqual(run_end["endpoint"], "https://example.com")
+            self.assertEqual(run_end["custom_count"], 7)
+            self.assertEqual(run_end["http_request_attempt_count"], 2)
+            self.assertEqual(run_end["http_retry_count"], 1)
+            self.assertEqual(run_end["http_2xx_count"], 1)
+            self.assertEqual(run_end["http_429_count"], 1)
+            self.assertGreater(run_end["http_request_bytes_total"], 0)
+            self.assertGreater(run_end["http_response_bytes_total"], 0)
+            self.assertIn("cpu_count_logical", run_end)
+
+    def test_logging_context_records_system_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "events.json"
+            try:
+                with (
+                    self.assertRaises(SystemExit),
+                    src.logging(
+                        command="unit-test",
+                        logging_config=LoggingSettings(
+                            terminal_level="critical",
+                            log_file_level="debug",
+                            log_file=log_file,
+                            run="test-run",
+                        ),
+                    ),
+                ):
+                    raise SystemExit(3)
+            finally:
+                logger = logging.getLogger("")
+                for handler_ in list(logger.handlers):
+                    logger.removeHandler(handler_)
+                    handler_.close()
+
+            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
+            run_end = next(row for row in rows if row["event"] == "run" and row["phase"] == "end")
+            self.assertEqual(run_end["status"], "error")
+            self.assertEqual(run_end["error_type"], "SystemExit")
+            self.assertEqual(run_end["exit_code"], 3)
 
     def test_httpx_request_logs_are_debug_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -951,15 +1335,73 @@ class HTTPClientTest(unittest.TestCase):
 
 
 class ClientTest(unittest.TestCase):
+    def test_normalize_sourcegraph_endpoint(self) -> None:
+        self.assertEqual(
+            normalize_sourcegraph_endpoint(" https://sourcegraph.example.com/ "),
+            "https://sourcegraph.example.com",
+        )
+        self.assertEqual(
+            normalize_sourcegraph_endpoint("http://localhost:3080/"),
+            "http://localhost:3080",
+        )
+        with self.assertRaisesRegex(ValueError, "https:// URL"):
+            normalize_sourcegraph_endpoint("http://localhost:3080", require_https=True)
+        with self.assertRaisesRegex(ValueError, "http:// or https:// URL"):
+            normalize_sourcegraph_endpoint("sourcegraph.example.com")
+
     def test_sourcegraph_client_builds_graphql_request(self) -> None:
         http = RecordingHTTP([{"data": {"currentUser": {"username": "alice"}}}])
-        client = SourcegraphClient("https://sourcegraph.example.com/", "token", http=http)
+        client = SourcegraphClient(" https://sourcegraph.example.com/ ", "token", http=http)
         data = client.graphql("query Viewer { currentUser { username } }")
 
+        self.assertEqual(client.endpoint, "https://sourcegraph.example.com")
         self.assertEqual(data, {"currentUser": {"username": "alice"}})
         self.assertEqual(http.calls[0]["method"], "POST")
         self.assertEqual(http.calls[0]["url"], "https://sourcegraph.example.com/.api/graphql")
         self.assertEqual(http.calls[0]["headers"], {"Authorization": "token token"})
+
+    def test_sourcegraph_client_streams_connection_nodes(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "users": {
+                            "nodes": [{"username": "alice"}],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                },
+                {
+                    "data": {
+                        "users": {
+                            "nodes": [{"username": "bob"}],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                },
+            ]
+        )
+        client = SourcegraphClient("https://sourcegraph.example.com", "token", http=http)
+        nodes = list(
+            client.stream_connection_nodes(
+                """
+                query Users($first: Int, $after: String) {
+                    users(first: $first, after: $after) {
+                        nodes { username }
+                        pageInfo { hasNextPage endCursor }
+                    }
+                }
+                """,
+                connection_path=("users",),
+                page_size=1,
+            )
+        )
+
+        self.assertEqual(nodes, [{"username": "alice"}, {"username": "bob"}])
+        first_body = json_dict(http.calls[0]["json_body"])
+        second_body = json_dict(http.calls[1]["json_body"])
+        self.assertEqual(first_body["variables"], {"first": 1, "after": None})
+        self.assertEqual(second_body["variables"], {"first": 1, "after": "cursor-1"})
 
     def test_sourcegraph_client_validate_queries_current_user(self) -> None:
         http = RecordingHTTP([{"data": {"currentUser": {"username": "alice"}}}])
@@ -1023,6 +1465,119 @@ query Items($first: Int!, $after: String, $userId: ID!) {
         self.assertEqual(
             http.calls[1]["json_body"]["variables"],
             {"userId": "u1", "first": 2, "after": "cursor-1"},
+        )
+
+    def test_graphql_client_streams_connection_nodes(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "viewer": {
+                            "items": {
+                                "nodes": [{"id": "1"}],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": "cursor-1",
+                                },
+                            }
+                        }
+                    }
+                },
+                {
+                    "data": {
+                        "viewer": {
+                            "items": {
+                                "nodes": [{"id": "2"}],
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                            }
+                        }
+                    }
+                },
+            ]
+        )
+        client = GraphQLClient("https://example.com/graphql", {}, "Example", http=http)
+        query = """
+query Items($first: Int!, $after: String, $userId: ID!) {
+  viewer { items { nodes { id } pageInfo { hasNextPage endCursor } } }
+}
+"""
+
+        nodes = list(
+            client.stream_connection_nodes(
+                query,
+                variables={"userId": "u1"},
+                connection_path=("viewer", "items"),
+                page_size=2,
+            )
+        )
+
+        self.assertEqual(nodes, [{"id": "1"}, {"id": "2"}])
+        self.assertEqual(
+            http.calls[0]["json_body"]["variables"],
+            {"userId": "u1", "first": 2, "after": None},
+        )
+        self.assertEqual(
+            http.calls[1]["json_body"]["variables"],
+            {"userId": "u1", "first": 2, "after": "cursor-1"},
+        )
+
+    def test_stream_connection_nodes_accepts_execute_callback(self) -> None:
+        calls: list[dict[str, Any]] = []
+        responses: list[JSONDict] = [
+            {
+                "viewer": {
+                    "items": {
+                        "nodes": [{"id": "1"}],
+                        "pageInfo": {
+                            "hasNextPage": True,
+                            "endCursor": "cursor-1",
+                        },
+                    }
+                }
+            },
+            {
+                "viewer": {
+                    "items": {
+                        "nodes": [{"id": "2"}],
+                        "pageInfo": {
+                            "hasNextPage": False,
+                            "endCursor": None,
+                        },
+                    }
+                }
+            },
+        ]
+
+        def execute(query: str, variables: Mapping[str, Any] | None) -> JSONDict:
+            calls.append({"query": query, "variables": dict(variables or {})})
+            return responses.pop(0)
+
+        query = """
+query Items($first: Int!, $after: String, $userId: ID!) {
+  viewer { items { nodes { id } pageInfo { hasNextPage endCursor } } }
+}
+"""
+
+        nodes = list(
+            stream_connection_nodes(
+                execute,
+                query,
+                variables={"userId": "u1"},
+                connection_path=("viewer", "items"),
+                page_size=2,
+            )
+        )
+
+        self.assertEqual(nodes, [{"id": "1"}, {"id": "2"}])
+        self.assertEqual(
+            [call["variables"] for call in calls],
+            [
+                {"userId": "u1", "first": 2, "after": None},
+                {"userId": "u1", "first": 2, "after": "cursor-1"},
+            ],
         )
 
     def test_graphql_client_emits_query_debug_events(self) -> None:
@@ -1126,6 +1681,78 @@ query Items($first: Int!, $after: String) {
                 query,
                 page_size=100,
             )
+
+    def test_graphql_client_rejects_stalled_cursor(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "items": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                },
+                {
+                    "data": {
+                        "items": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                },
+            ]
+        )
+        client = GraphQLClient("https://example.com/graphql", {}, "Example", http=http)
+        query = """
+query Items($first: Int!, $after: String) {
+  items { nodes { id } pageInfo { hasNextPage endCursor } }
+}
+"""
+
+        with self.assertRaisesRegex(GraphQLError, "stalled"):
+            client.execute(
+                query,
+                page_size=100,
+            )
+
+    def test_graphql_client_preserves_http_status_on_transport_errors(self) -> None:
+        class FailingHTTP(RecordingHTTP):
+            def json(
+                self,
+                method: str,
+                url: str,
+                *,
+                headers: Mapping[str, str] | None = None,
+                query: Mapping[str, str | int | float | bool | None] | None = None,
+                json_body: object | None = None,
+            ) -> dict[str, Any]:
+                raise HTTPClientError("unavailable", status_code=503)
+
+        client = GraphQLClient("https://example.com/graphql", {}, "Example", http=FailingHTTP())
+
+        with self.assertRaises(GraphQLError) as raised:
+            client.execute("query Viewer { viewer { login } }", follow_pages=False)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertFalse(raised.exception.is_application_error)
+
+    def test_graphql_client_marks_application_errors(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {},
+                    "errors": [{"message": "field does not exist"}],
+                }
+            ]
+        )
+        client = GraphQLClient("https://example.com/graphql", {}, "Example", http=http)
+
+        with self.assertRaises(GraphQLError) as raised:
+            client.execute("query Broken { missingField }", follow_pages=False)
+
+        self.assertIsNone(raised.exception.status_code)
+        self.assertTrue(raised.exception.is_application_error)
 
     def test_github_pr_ref_from_url(self) -> None:
         self.assertEqual(
