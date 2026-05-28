@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import UnionType
-from typing import Any, Final, Literal, Union, cast, get_args, get_origin
+from typing import Any, Final, Literal, TypeVar, Union, cast, get_args, get_origin
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -77,6 +77,9 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+ConfigType = TypeVar("ConfigType", bound=Config)
+
+
 def config_field(
     *,
     default: Any = ...,
@@ -112,7 +115,7 @@ def config_field(
     )
     field_kwargs: dict[str, Any] = {
         "description": help or None,
-        "json_schema_extra": _config_json_schema_extra(option),
+        "json_schema_extra": cast(JsonDict, {_CONFIG_OPTION_KEY: _config_option_payload(option)}),
     }
     if gt is not None:
         field_kwargs["gt"] = gt
@@ -147,8 +150,8 @@ def load_config_env_file(path: Path | None) -> dict[str, str]:
     return {key: value for key, value in dotenv_values(path).items() if value is not None}
 
 
-def load_config[ConfigT: Config](
-    config_cls: type[ConfigT],
+def load_config(
+    config_cls: type[ConfigType],
     *,
     env_file: Path | None = DEFAULT_CONFIG_ENV_FILE,
     cli_overrides: Mapping[str, object] | None = None,
@@ -157,7 +160,7 @@ def load_config[ConfigT: Config](
     resolve_op_refs: bool = False,
     op_client: OnePasswordClient | None = None,
     require: Iterable[str] = (),
-) -> ConfigT:
+) -> ConfigType:
     """Load, merge, and validate a Config model."""
     base = Path.cwd() if base_dir is None else base_dir
     resolved_env_file = _path_for_source(env_file, base) if env_file is not None else None
@@ -225,8 +228,8 @@ def add_config_arguments(
         group.add_argument(option.cli_flag, *option.cli_aliases, **argument_kwargs)
 
 
-def config_parse_args[ConfigT: Config](
-    config_cls: type[ConfigT],
+def config_parse_args(
+    config_cls: type[ConfigType],
     *,
     parser: argparse.ArgumentParser | None = None,
     argv: Sequence[str] | None = None,
@@ -237,7 +240,7 @@ def config_parse_args[ConfigT: Config](
     resolve_op_refs: bool = True,
     op_client: OnePasswordClient | None = None,
     require: Iterable[str] = (),
-) -> ConfigT:
+) -> ConfigType:
     """Parse Config CLI flags and return a validated Config model."""
     max_help_position = _config_help_max_position(config_cls, include_env_file=include_env_file)
     argument_parser = parser or argparse.ArgumentParser(
@@ -349,8 +352,8 @@ def config_env_file_from_args(args: argparse.Namespace, *, attr: str = "env_file
     return Path(cast(str, value)).expanduser() if value else None
 
 
-def load_config_from_args[ConfigT: Config](
-    config_cls: type[ConfigT],
+def load_config_from_args(
+    config_cls: type[ConfigType],
     args: argparse.Namespace,
     *,
     env: Mapping[str, str] | None = None,
@@ -358,7 +361,7 @@ def load_config_from_args[ConfigT: Config](
     resolve_op_refs: bool = True,
     op_client: OnePasswordClient | None = None,
     require: Iterable[str] = (),
-) -> ConfigT:
+) -> ConfigType:
     """Load Config using argparse values produced by `add_config_arguments`.
 
     Secret references are resolved by default because CLI entrypoints usually need
@@ -389,12 +392,12 @@ def require_config_values(config: Config, fields: Iterable[str]) -> None:
         raise ConfigError("Missing required Config value(s): " + ", ".join(missing))
 
 
-def resolve_config_refs[ConfigT: Config](
-    config: ConfigT,
+def resolve_config_refs(
+    config: ConfigType,
     *,
     fields: Iterable[str] | None = None,
     client: OnePasswordClient | None = None,
-) -> ConfigT:
+) -> ConfigType:
     """Resolve `op://...` string fields and return an updated Config."""
     selected = set(fields) if fields is not None else None
     updates: dict[str, str] = {}
@@ -452,10 +455,6 @@ def _config_option_payload(option: ConfigOption) -> dict[str, object]:
         "secret": option.secret,
         "required": option.required,
     }
-
-
-def _config_json_schema_extra(option: ConfigOption) -> JsonDict:
-    return cast(JsonDict, {_CONFIG_OPTION_KEY: _config_option_payload(option)})
 
 
 def _config_option_from_payload(payload: Mapping[str, object]) -> ConfigOption | None:

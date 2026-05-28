@@ -155,20 +155,14 @@ class HTTPClient:
                         return payload
             except HTTPClientError:
                 raise
-            except httpx.TimeoutException as exception:
-                record_http_attempt(request_bytes=len(body or b""), transport_error=True)
-                if not self._should_retry(None, attempt):
-                    raise HTTPClientError(
-                        f"HTTP request timed out for {method} {_safe_url(request_url)}: "
-                        f"{_exception_message(exception)}"
-                    ) from exception
-                record_http_retry()
-                self._sleep_before_retry(attempt, None)
             except httpx.TransportError as exception:
                 record_http_attempt(request_bytes=len(body or b""), transport_error=True)
                 if not self._should_retry(None, attempt):
+                    failure = (
+                        "timed out" if isinstance(exception, httpx.TimeoutException) else "failed"
+                    )
                     raise HTTPClientError(
-                        f"HTTP request failed for {method} {_safe_url(request_url)}: "
+                        f"HTTP request {failure} for {method} {_safe_url(request_url)}: "
                         f"{_exception_message(exception)}"
                     ) from exception
                 record_http_retry()
@@ -199,7 +193,7 @@ class HTTPClient:
         return status_code is None or status_code in self.retryable_status_codes
 
     def _sleep_before_retry(self, attempt: int, retry_after: str | None) -> None:
-        delay = _retry_after_seconds(retry_after)
+        delay = retry_after_seconds(retry_after)
         if delay is None:
             delay = min(
                 self.retry_base_delay_seconds * (2 ** (attempt - 1)),
@@ -271,7 +265,7 @@ def _exception_message(exception: Exception) -> str:
     return str(exception) or type(exception).__name__
 
 
-def _retry_after_seconds(value: str | None) -> float | None:
+def retry_after_seconds(value: str | None) -> float | None:
     if not value:
         return None
     try:

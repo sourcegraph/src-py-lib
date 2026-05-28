@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Final, cast
 
 from src_py_lib.utils.config import Config, config_field
-from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.http import HTTPClient, HTTPClientError, retry_after_seconds
 from src_py_lib.utils.json_types import JSONDict, json_dict, json_list, json_str
 
 SLACK_API_URL: Final[str] = "https://slack.com/api"
@@ -83,7 +83,7 @@ class SlackClient:
                 )
             except HTTPClientError as exception:
                 if exception.status_code == 429:
-                    wait_seconds = _retry_after_seconds(exception.headers.get("retry-after")) or 5.0
+                    wait_seconds = retry_after_seconds(exception.headers.get("retry-after")) or 5.0
                     logger.warning("Slack %s rate-limited; sleeping %.0fs.", method, wait_seconds)
                     self.pacer.bump_after_rate_limit(method, wait_seconds)
                     continue
@@ -130,15 +130,6 @@ class SlackClient:
         if not url:
             raise SlackError("Slack auth.test response did not include workspace URL.")
         return url
-
-
-def _retry_after_seconds(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return max(float(value), 0.0)
-    except ValueError:
-        return None
 
 
 def slack_client_from_config(

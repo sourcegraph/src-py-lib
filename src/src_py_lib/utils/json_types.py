@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
-type JSONValue = None | bool | int | float | str | list[JSONValue] | dict[str, JSONValue]
-type JSONDict = dict[str, JSONValue]
-type JSONArray = list[JSONValue]
+JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
+JSONDict: TypeAlias = dict[str, JSONValue]
+JSONArray: TypeAlias = list[JSONValue]
 
 
 def json_dict(value: object) -> JSONDict:

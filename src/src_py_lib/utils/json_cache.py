@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
+
+Entry = TypeVar("Entry")
 
 
-def load_json_cache[Entry](
+def load_json_cache(
     path: Path,
     parse: Callable[[Any], Entry] | None = None,
 ) -> dict[str, Entry]:
@@ -27,7 +29,7 @@ def save_json_cache(path: Path, cache: Mapping[str, object]) -> None:
     path.write_text(json.dumps(dict(cache), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def load_json_subset[Entry](
+def load_json_subset(
     path: Path,
     keys: list[str],
     parse: Callable[[Any], Entry] | None = None,
