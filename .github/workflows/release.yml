@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       IMPORT_NAME: src_py_lib
-      PYTHON_VERSION: "3.13"
+      PYTHON_VERSION: "3.11"
       UV_VERSION: "0.11.7"
 
     steps:
