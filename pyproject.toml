@@ -1,24 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "ruff>=0.7.0",
+]
+
 [project]
 name = "src-py-lib"
 version = "0.1.0"
-description = "Reusable Python helpers for Python projects."
+description = "Reusable Python helpers for Sourcegraph projects"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name="Sourcegraph" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.28,<1",
     "pydantic>=2,<3",
     "python-dotenv>=1.2,<2",
 ]
+keywords = [
+    "Sourcegraph"
+]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[project.urls]
+Homepage = "https://github.com/sourcegraph/src-py-lib"
+Issues = "https://github.com/sourcegraph/src-py-lib/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/src_py_lib"]
-
-[tool.uv]
-package = true
 
 [tool.pyright]
 include = ["src/src_py_lib"]
@@ -33,8 +57,5 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 
-[dependency-groups]
-dev = [
-    "pyright>=1.1.409",
-    "ruff>=0.7.0",
-]
+[tool.uv]
+package = true

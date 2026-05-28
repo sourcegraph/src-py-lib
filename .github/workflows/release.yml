@@ -143,6 +143,12 @@ jobs:
           cat > "${notes_path}" <<EOF
           ## Install
 
+          Install from PyPI:
+
+          \`\`\`sh
+          pip install src-py-lib
+          \`\`\`
+
           Install from the release wheel:
 
           \`\`\`sh
@@ -168,6 +174,12 @@ jobs:
             ${{ steps.build.outputs.checksum_path }}
             ${{ steps.notes.outputs.path }}
 
+      - name: Upload PyPI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pypi-distributions
+          path: ${{ steps.build.outputs.wheel_path }}
+
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -188,3 +200,26 @@ jobs:
               --notes-file "${notes_path}" \
               --verify-tag
           fi
+
+  pypi:
+    name: Publish PyPI package
+    needs: wheel
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/src-py-lib/
+
+    steps:
+      - name: Download built distribution
+        uses: actions/download-artifact@v7
+        with:
+          name: pypi-distributions
+          path: dist
+
+      - name: Publish PyPI package
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
