@@ -199,16 +199,18 @@ _SPAN_CONTEXT: contextvars.ContextVar[_SpanContext | None] = contextvars.Context
 )
 
 _HTTP_METRICS_LOCK: Final[threading.Lock] = threading.Lock()
-_http_request_attempt_count = 0
-_http_request_bytes_total = 0
-_http_response_bytes_total = 0
-_http_retry_count = 0
-_http_2xx_count = 0
-_http_3xx_count = 0
-_http_4xx_count = 0
-_http_429_count = 0
-_http_5xx_count = 0
-_http_transport_error_count = 0
+_HTTP_METRICS: dict[str, int] = {
+    "http_request_attempt_count": 0,
+    "http_request_bytes_total": 0,
+    "http_response_bytes_total": 0,
+    "http_retry_count": 0,
+    "http_2xx_count": 0,
+    "http_3xx_count": 0,
+    "http_4xx_count": 0,
+    "http_429_count": 0,
+    "http_5xx_count": 0,
+    "http_transport_error_count": 0,
+}
 
 
 @dataclass
@@ -423,20 +425,9 @@ def configure_logging(config: LoggingSettings | None = None) -> Path | None:
 
 def reset_observability_metrics() -> None:
     """Reset process-wide HTTP counters used by `logging_context()` run summaries."""
-    global _http_request_attempt_count, _http_request_bytes_total, _http_response_bytes_total
-    global _http_retry_count, _http_2xx_count, _http_3xx_count, _http_4xx_count
-    global _http_429_count, _http_5xx_count, _http_transport_error_count
     with _HTTP_METRICS_LOCK:
-        _http_request_attempt_count = 0
-        _http_request_bytes_total = 0
-        _http_response_bytes_total = 0
-        _http_retry_count = 0
-        _http_2xx_count = 0
-        _http_3xx_count = 0
-        _http_4xx_count = 0
-        _http_429_count = 0
-        _http_5xx_count = 0
-        _http_transport_error_count = 0
+        for metric_name in _HTTP_METRICS:
+            _HTTP_METRICS[metric_name] = 0
 
 
 def record_http_attempt(
@@ -447,51 +438,37 @@ def record_http_attempt(
     transport_error: bool = False,
 ) -> None:
     """Record one HTTP attempt for the current run summary."""
-    global _http_request_attempt_count, _http_request_bytes_total, _http_response_bytes_total
-    global _http_2xx_count, _http_3xx_count, _http_4xx_count, _http_429_count
-    global _http_5xx_count, _http_transport_error_count
     with _HTTP_METRICS_LOCK:
-        _http_request_attempt_count += 1
-        _http_request_bytes_total += request_bytes
-        _http_response_bytes_total += response_bytes
+        _HTTP_METRICS["http_request_attempt_count"] += 1
+        _HTTP_METRICS["http_request_bytes_total"] += request_bytes
+        _HTTP_METRICS["http_response_bytes_total"] += response_bytes
         if transport_error:
-            _http_transport_error_count += 1
+            _HTTP_METRICS["http_transport_error_count"] += 1
         if status_code is None:
             return
-        if 200 <= status_code < 300:
-            _http_2xx_count += 1
-        elif 300 <= status_code < 400:
-            _http_3xx_count += 1
-        elif 400 <= status_code < 500:
-            _http_4xx_count += 1
-            if status_code == 429:
-                _http_429_count += 1
-        elif status_code >= 500:
-            _http_5xx_count += 1
+        status_group = 5 if status_code >= 500 else status_code // 100
+        metric_name = {
+            2: "http_2xx_count",
+            3: "http_3xx_count",
+            4: "http_4xx_count",
+            5: "http_5xx_count",
+        }.get(status_group)
+        if metric_name is not None:
+            _HTTP_METRICS[metric_name] += 1
+        if status_code == 429:
+            _HTTP_METRICS["http_429_count"] += 1
 
 
 def record_http_retry() -> None:
     """Record that an HTTP attempt will be retried."""
-    global _http_retry_count
     with _HTTP_METRICS_LOCK:
-        _http_retry_count += 1
+        _HTTP_METRICS["http_retry_count"] += 1
 
 
 def observability_summary() -> dict[str, Any]:
     """Return process-wide counters accumulated since logging was configured."""
     with _HTTP_METRICS_LOCK:
-        return {
-            "http_request_attempt_count": _http_request_attempt_count,
-            "http_request_bytes_total": _http_request_bytes_total,
-            "http_response_bytes_total": _http_response_bytes_total,
-            "http_retry_count": _http_retry_count,
-            "http_2xx_count": _http_2xx_count,
-            "http_3xx_count": _http_3xx_count,
-            "http_4xx_count": _http_4xx_count,
-            "http_429_count": _http_429_count,
-            "http_5xx_count": _http_5xx_count,
-            "http_transport_error_count": _http_transport_error_count,
-        }
+        return dict(_HTTP_METRICS)
 
 
 @contextlib.contextmanager
@@ -814,9 +791,11 @@ def _log_level(value: int | str) -> int:
 
 def _structured_log_fields(record: logging.LogRecord) -> tuple[str, dict[str, Any]]:
     message = record.getMessage()
-    fields: dict[str, Any] = {}
-    if record.name == "httpx" and message.startswith(_HTTPX_REQUEST_PREFIX):
-        fields["level"] = "DEBUG"
+    fields: dict[str, Any] = (
+        {"level": "DEBUG"}
+        if record.name == "httpx" and message.startswith(_HTTPX_REQUEST_PREFIX)
+        else {}
+    )
     if not message.startswith(_HTTPCORE_RESPONSE_HEADERS_PREFIX):
         return message, fields
     try:

@@ -115,7 +115,7 @@ def config_field(
     )
     field_kwargs: dict[str, Any] = {
         "description": help or None,
-        "json_schema_extra": _config_json_schema_extra(option),
+        "json_schema_extra": cast(JsonDict, {_CONFIG_OPTION_KEY: _config_option_payload(option)}),
     }
     if gt is not None:
         field_kwargs["gt"] = gt
@@ -455,10 +455,6 @@ def _config_option_payload(option: ConfigOption) -> dict[str, object]:
         "secret": option.secret,
         "required": option.required,
     }
-
-
-def _config_json_schema_extra(option: ConfigOption) -> JsonDict:
-    return cast(JsonDict, {_CONFIG_OPTION_KEY: _config_option_payload(option)})
 
 
 def _config_option_from_payload(payload: Mapping[str, object]) -> ConfigOption | None:
