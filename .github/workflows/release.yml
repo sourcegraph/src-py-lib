@@ -23,8 +23,15 @@ defaults:
     shell: bash
 
 jobs:
+  validate:
+    name: Validate
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
   wheel:
     name: Build wheel
+    needs: validate
     runs-on: ubuntu-24.04
     env:
       IMPORT_NAME: src_py_lib
@@ -45,6 +52,14 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
+
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
@@ -62,6 +77,14 @@ jobs:
             echo "::error title=Missing tag::Tag '${release_tag}' was not fetched. Create and push it before running this workflow."
             exit 1
           fi
+          tag_revision="$(git rev-list -n 1 "${release_tag}")"
+          git fetch --no-tags origin main
+          main_revision="$(git rev-parse origin/main)"
+          if ! git merge-base --is-ancestor "${tag_revision}" "${main_revision}"; then
+            echo "::error title=Tag is not on main::Tag '${release_tag}' points at ${tag_revision}, which is not reachable from origin/main."
+            echo "::error::Merge the release PR first, then tag the main commit."
+            exit 1
+          fi
 
           project_version=$(uv run --frozen python - <<'PY'
           import tomllib
@@ -76,22 +99,6 @@ jobs:
           fi
 
           echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
-
-      - name: Validate package
-        run: |
-          uv lock --check
-          uv run --frozen ruff check .
-          uv run --frozen ruff format --check .
-          uv run --frozen pyright
-          uv run --frozen python -m unittest discover -s tests
-          uv run --frozen python - <<'PY'
-          import os
-
-          import src_py_lib
-
-          if src_py_lib.__name__ != os.environ["IMPORT_NAME"]:
-              raise SystemExit(f"unexpected import name: {src_py_lib.__name__}")
-          PY
 
       - name: Build distributions
         id: build
@@ -115,17 +122,24 @@ jobs:
           wheel_path="${project_wheels[0]}"
           wheel_name="$(basename "${wheel_path}")"
           source_distribution_path="${source_distributions[0]}"
-          checksum_path="${wheel_path}.sha256"
+          source_distribution_name="$(basename "${source_distribution_path}")"
+          wheel_checksum_path="${wheel_path}.sha256"
+          source_distribution_checksum_path="${source_distribution_path}.sha256"
 
           (
             cd "$(dirname "${wheel_path}")"
-            shasum -a 256 "${wheel_name}" > "$(basename "${checksum_path}")"
+            shasum -a 256 "${wheel_name}" > "$(basename "${wheel_checksum_path}")"
+            shasum -a 256 "${source_distribution_name}" > "$(basename "${source_distribution_checksum_path}")"
           )
 
-          echo "wheel_path=${wheel_path}" >> "${GITHUB_OUTPUT}"
-          echo "wheel_name=${wheel_name}" >> "${GITHUB_OUTPUT}"
-          echo "source_distribution_path=${source_distribution_path}" >> "${GITHUB_OUTPUT}"
-          echo "checksum_path=${checksum_path}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "wheel_path=${wheel_path}"
+            echo "wheel_name=${wheel_name}"
+            echo "source_distribution_path=${source_distribution_path}"
+            echo "source_distribution_name=${source_distribution_name}"
+            echo "wheel_checksum_path=${wheel_checksum_path}"
+            echo "source_distribution_checksum_path=${source_distribution_checksum_path}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Smoke test installed wheel
         run: |
@@ -147,6 +161,7 @@ jobs:
         run: |
           release_tag="${{ steps.release.outputs.tag }}"
           wheel_name="${{ steps.build.outputs.wheel_name }}"
+          source_distribution_name="${{ steps.build.outputs.source_distribution_name }}"
           notes_path="build/release/release-notes.md"
           cat > "${notes_path}" <<EOF
           ## Install
@@ -163,13 +178,19 @@ jobs:
           pip install "https://github.com/sourcegraph/src-py-lib/releases/download/${release_tag}/${wheel_name}"
           \`\`\`
 
+          Source distribution:
+
+          \`\`\`sh
+          curl -LO "https://github.com/sourcegraph/src-py-lib/releases/download/${release_tag}/${source_distribution_name}"
+          \`\`\`
+
           Or install this tag with uv:
 
           \`\`\`sh
           uv add "git+https://github.com/sourcegraph/src-py-lib.git@${release_tag}"
           \`\`\`
 
-          Verify downloaded wheel assets with the matching \`.sha256\` file.
+          Verify downloaded assets with the matching \`.sha256\` files.
           EOF
           echo "path=${notes_path}" >> "${GITHUB_OUTPUT}"
 
@@ -179,7 +200,9 @@ jobs:
           name: src-py-lib-release
           path: |
             ${{ steps.build.outputs.wheel_path }}
-            ${{ steps.build.outputs.checksum_path }}
+            ${{ steps.build.outputs.source_distribution_path }}
+            ${{ steps.build.outputs.wheel_checksum_path }}
+            ${{ steps.build.outputs.source_distribution_checksum_path }}
             ${{ steps.notes.outputs.path }}
 
       - name: Upload PyPI artifact
@@ -196,16 +219,23 @@ jobs:
         run: |
           release_tag="${{ steps.release.outputs.tag }}"
           wheel_path="${{ steps.build.outputs.wheel_path }}"
-          checksum_path="${{ steps.build.outputs.checksum_path }}"
+          source_distribution_path="${{ steps.build.outputs.source_distribution_path }}"
+          wheel_checksum_path="${{ steps.build.outputs.wheel_checksum_path }}"
+          source_distribution_checksum_path="${{ steps.build.outputs.source_distribution_checksum_path }}"
           notes_path="${{ steps.notes.outputs.path }}"
+          release_assets=(
+            "${wheel_path}"
+            "${source_distribution_path}"
+            "${wheel_checksum_path}"
+            "${source_distribution_checksum_path}"
+          )
 
           if gh release view "${release_tag}" >/dev/null 2>&1; then
             gh release edit "${release_tag}" --title "${release_tag}" --notes-file "${notes_path}"
-            gh release upload "${release_tag}" "${wheel_path}" "${checksum_path}" --clobber
+            gh release upload "${release_tag}" "${release_assets[@]}" --clobber
           else
             gh release create "${release_tag}" \
-              "${wheel_path}" \
-              "${checksum_path}" \
+              "${release_assets[@]}" \
               --title "${release_tag}" \
               --notes-file "${notes_path}" \
               --verify-tag

@@ -2,16 +2,37 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+import base64
+import collections
+import json
+import queue
+import time
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Final, cast
 from urllib.parse import urlsplit
 
 from src_py_lib.clients.graphql import GraphQLClient, stream_connection_nodes
 from src_py_lib.utils.config import Config, config_field
-from src_py_lib.utils.http import HTTPClient
-from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict
+from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
+from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list
+from src_py_lib.utils.logging import (
+    current_trace_context,
+    new_trace_context,
+    trace_context_from_traceparent,
+    traceparent_header,
+)
 
 DEFAULT_SOURCEGRAPH_ENDPOINT = "https://sourcegraph.com"
+SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE: Final[str] = "ExternalService"
+SOURCEGRAPH_REPOSITORY_NODE_TYPE: Final[str] = "Repository"
+REQUEST_TRACE_HEADER: Final[str] = "X-Sourcegraph-Request-Trace"
+TRACEPARENT_HEADER: Final[str] = "traceparent"
+TRACE_ID_RESPONSE_HEADER: Final[str] = "x-trace"
+TRACE_SPAN_RESPONSE_HEADER: Final[str] = "x-trace-span"
+TRACE_URL_RESPONSE_HEADER: Final[str] = "x-trace-url"
+JAEGER_TRACE_RETRY_DELAYS_SECONDS: Final[tuple[float, ...]] = (0.0, 2.0, 5.0)
+RETRYABLE_JAEGER_TRACE_STATUS_CODES: Final[frozenset[int]] = frozenset({404, 502, 503, 504})
 SOURCEGRAPH_VALIDATE_QUERY = """
 query SourcegraphClientValidate {
   currentUser {
@@ -19,6 +40,58 @@ query SourcegraphClientValidate {
   }
 }
 """
+
+
+class SourcegraphJaegerTraceError(RuntimeError):
+    """Raised when a Sourcegraph Jaeger/debug trace cannot be fetched."""
+
+
+@dataclass(frozen=True)
+class SourcegraphTrace:
+    """Trace metadata Sourcegraph returned for one traced request."""
+
+    trace_id: str
+    span_id: str | None = None
+    trace_url: str | None = None
+    parent_trace_id: str | None = None
+    parent_span_id: str | None = None
+
+    def to_json(self) -> JSONDict:
+        payload: JSONDict = {"trace_id": self.trace_id}
+        if self.span_id is not None:
+            payload["span_id"] = self.span_id
+        if self.trace_url is not None:
+            payload["trace_url"] = self.trace_url
+        if self.parent_trace_id is not None:
+            payload["parent_trace_id"] = self.parent_trace_id
+        if self.parent_span_id is not None:
+            payload["parent_span_id"] = self.parent_span_id
+        return payload
+
+
+@dataclass(frozen=True)
+class SourcegraphJaegerTraceSummary:
+    """Compact summary of one Sourcegraph Jaeger/debug trace."""
+
+    trace: SourcegraphTrace
+    jaeger_found: bool
+    span_count: int = 0
+    hot_operations: tuple[JSONDict, ...] = ()
+    graphql_operations: tuple[JSONDict, ...] = ()
+    errored_spans: tuple[JSONDict, ...] = ()
+    error: str = ""
+
+    def to_json(self) -> JSONDict:
+        payload = self.trace.to_json()
+        payload["jaeger_found"] = self.jaeger_found
+        if not self.jaeger_found:
+            payload["error"] = self.error
+            return payload
+        payload["span_count"] = self.span_count
+        payload["hot_operations"] = [dict(operation) for operation in self.hot_operations]
+        payload["graphql_operations"] = [dict(operation) for operation in self.graphql_operations]
+        payload["errored_spans"] = [dict(span) for span in self.errored_spans]
+        return payload
 
 
 def normalize_sourcegraph_endpoint(endpoint: str, *, require_https: bool = False) -> str:
@@ -39,6 +112,44 @@ def normalize_sourcegraph_endpoint(endpoint: str, *, require_https: bool = False
             f"could not parse hostname from Sourcegraph endpoint {normalized_endpoint!r}"
         )
     return normalized_endpoint
+
+
+def encode_sourcegraph_node_id(node_type: str, database_id: int) -> str:
+    """Return a Sourcegraph opaque GraphQL Node ID for `node_type:database_id`."""
+    raw = f"{node_type}:{database_id}".encode()
+    return base64.b64encode(raw).decode()
+
+
+def decode_sourcegraph_node_id(node_type: str, graphql_id: str) -> int:
+    """Return the database ID from a Sourcegraph opaque GraphQL Node ID."""
+    try:
+        raw = base64.b64decode(graphql_id, validate=True).decode()
+    except (ValueError, UnicodeDecodeError) as exception:
+        raise ValueError(f"not a valid base64 GraphQL Node ID: {graphql_id!r}") from exception
+    decoded_node_type, separator, database_id = raw.partition(":")
+    if not separator or decoded_node_type != node_type:
+        raise ValueError(f"not a {node_type} Node ID: {graphql_id!r} (decoded: {raw!r})")
+    try:
+        return int(database_id)
+    except ValueError as exception:
+        raise ValueError(
+            f"{node_type} Node ID has non-integer suffix: {graphql_id!r} (decoded: {raw!r})"
+        ) from exception
+
+
+def decode_external_service_id(graphql_id: str) -> int:
+    """Return the database ID from an opaque ExternalService GraphQL Node ID."""
+    return decode_sourcegraph_node_id(SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE, graphql_id)
+
+
+def encode_repository_id(database_id: int) -> str:
+    """Return an opaque Repository GraphQL Node ID from a database ID."""
+    return encode_sourcegraph_node_id(SOURCEGRAPH_REPOSITORY_NODE_TYPE, database_id)
+
+
+def decode_repository_id(graphql_id: str) -> int:
+    """Return the database ID from an opaque Repository GraphQL Node ID."""
+    return decode_sourcegraph_node_id(SOURCEGRAPH_REPOSITORY_NODE_TYPE, graphql_id)
 
 
 class SourcegraphClientConfig(Config):
@@ -68,11 +179,20 @@ class SourcegraphClient:
 
     `endpoint` should be the instance base URL, for example
     `https://sourcegraph.example.com`.
+
+    Set `trace=True` to ask Sourcegraph to retain traces for each GraphQL
+    request. Traced requests are available through `drain_traces()` and can be
+    fetched from the instance's Jaeger/debug endpoint with
+    `stream_jaeger_trace_summaries()`.
     """
 
     endpoint: str
     token: str
     http: HTTPClient = field(default_factory=HTTPClient)
+    trace: bool = False
+    _traces: queue.Queue[SourcegraphTrace] = field(
+        default_factory=lambda: queue.Queue[SourcegraphTrace](), init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.endpoint = normalize_sourcegraph_endpoint(self.endpoint)
@@ -110,18 +230,243 @@ class SourcegraphClient:
             )
         return current_user
 
+    def drain_traces(self) -> list[SourcegraphTrace]:
+        """Return traced request metadata recorded since the last drain."""
+        traces: list[SourcegraphTrace] = []
+        while True:
+            try:
+                traces.append(self._traces.get_nowait())
+            except queue.Empty:
+                return traces
+
+    def stream_jaeger_trace_summaries(
+        self,
+        traces: Iterable[SourcegraphTrace] | None = None,
+        *,
+        retry_delays_seconds: Sequence[float] = JAEGER_TRACE_RETRY_DELAYS_SECONDS,
+    ) -> Iterator[SourcegraphJaegerTraceSummary]:
+        """Yield compact Jaeger/debug summaries for traced Sourcegraph requests."""
+        for trace in self.drain_traces() if traces is None else traces:
+            yield self.fetch_jaeger_trace_summary(
+                trace,
+                retry_delays_seconds=retry_delays_seconds,
+            )
+
+    def fetch_jaeger_trace_summary(
+        self,
+        trace: SourcegraphTrace | str,
+        *,
+        retry_delays_seconds: Sequence[float] = JAEGER_TRACE_RETRY_DELAYS_SECONDS,
+    ) -> SourcegraphJaegerTraceSummary:
+        """Fetch one Jaeger/debug trace and return a compact summary."""
+        trace_metadata = trace if isinstance(trace, SourcegraphTrace) else SourcegraphTrace(trace)
+        try:
+            jaeger_trace = self.fetch_jaeger_trace(
+                trace_metadata.trace_id,
+                retry_delays_seconds=retry_delays_seconds,
+            )
+        except SourcegraphJaegerTraceError as error:
+            return SourcegraphJaegerTraceSummary(
+                trace=trace_metadata,
+                jaeger_found=False,
+                error=str(error),
+            )
+        return summarize_jaeger_trace(trace_metadata, jaeger_trace)
+
+    def fetch_jaeger_trace(
+        self,
+        trace_id: str,
+        *,
+        retry_delays_seconds: Sequence[float] = JAEGER_TRACE_RETRY_DELAYS_SECONDS,
+    ) -> JSONDict:
+        """Fetch a raw Jaeger/debug trace from the Sourcegraph instance."""
+        url = f"{self.endpoint}/-/debug/jaeger/api/traces/{trace_id}"
+        last_error = "trace not found"
+        for delay_seconds in retry_delays_seconds:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            try:
+                payload = self.http.json("GET", url, headers=self._authorization_headers())
+            except HTTPClientError as error:
+                last_error = sourcegraph_trace_fetch_error(error)
+                if (
+                    error.status_code is None
+                    or error.status_code in RETRYABLE_JAEGER_TRACE_STATUS_CODES
+                ):
+                    continue
+                raise SourcegraphJaegerTraceError(last_error) from error
+            for trace_value in json_list(payload.get("data")):
+                jaeger_trace = json_dict(trace_value)
+                if jaeger_trace:
+                    return jaeger_trace
+            errors = payload.get("errors")
+            last_error = json.dumps(errors) if errors else "trace not found"
+        raise SourcegraphJaegerTraceError(last_error)
+
     def _client(self) -> GraphQLClient:
         return GraphQLClient(
             url=f"{self.endpoint}/.api/graphql",
-            headers={"Authorization": f"token {self.token}"},
+            headers=self._graphql_headers,
             label="Sourcegraph",
             http=self.http,
+            response_hook=self._record_trace_response if self.trace else None,
         )
 
+    def _authorization_headers(self) -> dict[str, str]:
+        return {"Authorization": f"token {self.token}"}
 
-def sourcegraph_client_from_config(config: SourcegraphClientConfig) -> SourcegraphClient:
+    def _graphql_headers(self) -> dict[str, str]:
+        headers = self._authorization_headers()
+        if self.trace:
+            headers[REQUEST_TRACE_HEADER] = "true"
+            headers[TRACEPARENT_HEADER] = traceparent_header(
+                current_trace_context() or new_trace_context()
+            )
+        return headers
+
+    def _record_trace_response(
+        self, response: HTTPResponse, request_headers: Mapping[str, str]
+    ) -> None:
+        trace = sourcegraph_trace_from_headers(response.headers, request_headers)
+        if trace is not None:
+            self._traces.put(trace)
+
+
+def sourcegraph_client_from_config(
+    config: SourcegraphClientConfig,
+    *,
+    http: HTTPClient | None = None,
+    trace: bool = False,
+) -> SourcegraphClient:
     """Return a Sourcegraph API client from shared Sourcegraph Config fields."""
     return SourcegraphClient(
         endpoint=config.src_endpoint,
         token=config.src_access_token,
+        http=http or HTTPClient(),
+        trace=trace,
     )
+
+
+def sampled_traceparent() -> str:
+    """Compatibility wrapper for sampled W3C traceparent generation."""
+    return traceparent_header(sampled=True)
+
+
+def sourcegraph_trace_from_headers(
+    response_headers: Mapping[str, str], request_headers: Mapping[str, str]
+) -> SourcegraphTrace | None:
+    """Return Sourcegraph trace metadata from request/response headers."""
+    trace_id = header_value(response_headers, TRACE_ID_RESPONSE_HEADER)
+    if trace_id is None or not is_hex_identifier(trace_id, 32):
+        return None
+    span_id = header_value(response_headers, TRACE_SPAN_RESPONSE_HEADER)
+    trace_url = header_value(response_headers, TRACE_URL_RESPONSE_HEADER)
+    parent = trace_context_from_traceparent(header_value(request_headers, TRACEPARENT_HEADER))
+    return SourcegraphTrace(
+        trace_id=trace_id.lower(),
+        span_id=span_id.lower() if span_id and is_hex_identifier(span_id, 16) else span_id,
+        trace_url=trace_url,
+        parent_trace_id=parent.trace_id if parent is not None else None,
+        parent_span_id=parent.span_id if parent is not None else None,
+    )
+
+
+def is_hex_identifier(value: str, length: int) -> bool:
+    """Return whether `value` is a non-zero hex identifier of `length` characters."""
+    lowered = value.lower()
+    return (
+        len(lowered) == length
+        and any(character != "0" for character in lowered)
+        and all(character in "0123456789abcdef" for character in lowered)
+    )
+
+
+def header_value(headers: Mapping[str, str], name: str) -> str | None:
+    """Return one header value by case-insensitive name."""
+    lower_name = name.lower()
+    for header_name, value in headers.items():
+        if header_name.lower() == lower_name:
+            return value
+    return None
+
+
+def sourcegraph_trace_fetch_error(error: HTTPClientError) -> str:
+    """Return a concise, user-safe Jaeger trace fetch error."""
+    if error.status_code is None:
+        return str(error)
+    return f"HTTP {error.status_code}" + (f": {error.body[:200]}" if error.body else "")
+
+
+def summarize_jaeger_trace(
+    trace_metadata: SourcegraphTrace, jaeger_trace: JSONDict
+) -> SourcegraphJaegerTraceSummary:
+    """Return a compact summary of one raw Jaeger trace payload."""
+    spans = json_list(jaeger_trace.get("spans"))
+    durations_by_operation: dict[str, list[float]] = collections.defaultdict(list)
+    graphql_operations: collections.Counter[str] = collections.Counter()
+    errored_spans: list[JSONDict] = []
+
+    for span_value in spans:
+        span = json_dict(span_value)
+        if not span:
+            continue
+        operation = str(span.get("operationName") or "")
+        duration_ms = float_value(span.get("duration")) / 1000.0
+        durations_by_operation[operation].append(duration_ms)
+        tags = jaeger_span_tags(span)
+        operation_name = tags.get("graphql.operationName")
+        if isinstance(operation_name, str):
+            graphql_operations[operation_name] += 1
+        if tags.get("error") in {True, "true", "True"}:
+            errored_spans.append(
+                {
+                    "operation": operation,
+                    "duration_ms": round(duration_ms, 1),
+                    "description": json_scalar(tags.get("otel.status_description")),
+                }
+            )
+
+    hot_operations = [
+        {
+            "operation": operation,
+            "count": len(durations),
+            "sum_ms": round(sum(durations), 1),
+            "max_ms": round(max(durations), 1),
+        }
+        for operation, durations in durations_by_operation.items()
+    ]
+    hot_operations.sort(key=lambda operation: float(operation["sum_ms"]), reverse=True)
+    return SourcegraphJaegerTraceSummary(
+        trace=trace_metadata,
+        jaeger_found=True,
+        span_count=len(spans),
+        hot_operations=tuple(cast(JSONDict, operation) for operation in hot_operations[:10]),
+        graphql_operations=tuple(
+            {"operation": operation, "count": count}
+            for operation, count in graphql_operations.most_common(10)
+        ),
+        errored_spans=tuple(errored_spans[:5]),
+    )
+
+
+def jaeger_span_tags(span: JSONDict) -> dict[str, object]:
+    """Return Jaeger span tags keyed by tag name."""
+    tags: dict[str, object] = {}
+    for tag_value in json_list(span.get("tags")):
+        tag = json_dict(tag_value)
+        key = tag.get("key")
+        if isinstance(key, str):
+            tags[key] = tag.get("value")
+    return tags
+
+
+def float_value(value: object) -> float:
+    """Return a JSON number as float, excluding booleans."""
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else 0.0
+
+
+def json_scalar(value: object) -> JSONValue:
+    """Return `value` if it is a JSON scalar; otherwise return None."""
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return None

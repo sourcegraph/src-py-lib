@@ -8,6 +8,13 @@ This repo was created for Sourcegraph Implementation Engineering deployments,
 and is not intended, designed, built, or supported for use in any other scenario.
 Feel free to open issues or PRs, but responses are best effort.
 
+## Semantic Versioning
+
+- Release versions are `major.minor.patch`
+- Because this project is still major version 0:
+  - Minor version updates are breaking changes
+  - Patch version updates are not breaking changes
+
 ## Install
 
 From PyPI:

@@ -36,6 +36,9 @@ from src_py_lib.clients.slack import SlackClient
 from src_py_lib.clients.sourcegraph import (
     SourcegraphClient,
     SourcegraphClientConfig,
+    decode_external_service_id,
+    decode_repository_id,
+    encode_repository_id,
     normalize_sourcegraph_endpoint,
     sourcegraph_client_from_config,
 )
@@ -53,7 +56,7 @@ from src_py_lib.utils.config import (
     load_config_from_args,
     resolve_config_refs,
 )
-from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_types import JSONDict, json_dict, json_list
 from src_py_lib.utils.logging import (
     LoggingConfig,
@@ -975,8 +978,8 @@ class LoggingTest(unittest.TestCase):
             )
             self.assertEqual(outer_start["trace"], outer_end["trace"])
             self.assertEqual(outer_start["span"], outer_end["span"])
-            self.assertEqual(len(outer_start["trace"]), 8)
-            self.assertEqual(len(outer_start["span"]), 8)
+            self.assertEqual(len(outer_start["trace"]), 32)
+            self.assertEqual(len(outer_start["span"]), 16)
             self.assertNotIn("parent_span", outer_start)
 
             self.assertEqual(inside["trace"], outer_start["trace"])
@@ -997,7 +1000,7 @@ class LoggingTest(unittest.TestCase):
             )
             self.assertEqual(inner_start["trace"], outer_start["trace"])
             self.assertEqual(inner_start["span"], inner_end["span"])
-            self.assertEqual(len(inner_start["span"]), 8)
+            self.assertEqual(len(inner_start["span"]), 16)
             self.assertEqual(inner_start["parent_span"], outer_start["span"])
             self.assertNotEqual(inner_start["span"], outer_start["span"])
 
@@ -1018,6 +1021,21 @@ class LoggingTest(unittest.TestCase):
             self.assertEqual(inner_log["trace"], outer_start["trace"])
             self.assertEqual(inner_log["span"], inner_start["span"])
             self.assertEqual(inner_log["parent_span"], outer_start["span"])
+
+    def test_trace_context_helpers_generate_w3c_traceparent_headers(self) -> None:
+        root = src.new_trace_context()
+        child = root.child()
+
+        self.assertEqual(len(root.trace_id), 32)
+        self.assertEqual(len(root.span_id), 16)
+        self.assertEqual(child.trace_id, root.trace_id)
+        self.assertEqual(child.parent_span_id, root.span_id)
+        self.assertRegex(root.traceparent(), r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+        self.assertEqual(src.trace_context_from_traceparent(root.traceparent()), root)
+
+        with src.trace_context(root):
+            self.assertEqual(src.current_trace_context(), root)
+            self.assertEqual(src.traceparent_header(), root.traceparent())
 
     def test_event_can_lower_start_level_and_omit_success_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1249,6 +1267,22 @@ class HTTPClientTest(unittest.TestCase):
         self.assertEqual(json.loads(seen["body"]), {"hello": "world"})
         self.assertEqual(client.max_connections, 7)
 
+    def test_json_response_returns_payload_and_response_metadata(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ok": True},
+                headers={"X-Trace": "a" * 32},
+            )
+
+        client = HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler))
+        payload, response = client.json_response("GET", "https://example.com/api")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsInstance(response, HTTPResponse)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.header("X-Trace"), "a" * 32)
+
     def test_json_request_emits_structured_http_event(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -1335,6 +1369,19 @@ class HTTPClientTest(unittest.TestCase):
 
 
 class ClientTest(unittest.TestCase):
+    def test_sourcegraph_node_ids_convert_between_graphql_and_database_ids(self) -> None:
+        self.assertEqual(42, decode_external_service_id("RXh0ZXJuYWxTZXJ2aWNlOjQy"))
+        self.assertEqual("UmVwb3NpdG9yeTo5OQ==", encode_repository_id(99))
+        self.assertEqual(99, decode_repository_id("UmVwb3NpdG9yeTo5OQ=="))
+        self.assertEqual(99, src.decode_repository_id("UmVwb3NpdG9yeTo5OQ=="))
+
+        with self.assertRaisesRegex(ValueError, "not a valid base64"):
+            decode_repository_id("not base64")
+        with self.assertRaisesRegex(ValueError, "not a Repository Node ID"):
+            decode_repository_id("RXh0ZXJuYWxTZXJ2aWNlOjQy")
+        with self.assertRaisesRegex(ValueError, "non-integer suffix"):
+            decode_external_service_id("RXh0ZXJuYWxTZXJ2aWNlOmFiYw==")
+
     def test_normalize_sourcegraph_endpoint(self) -> None:
         self.assertEqual(
             normalize_sourcegraph_endpoint(" https://sourcegraph.example.com/ "),
@@ -1411,6 +1458,82 @@ class ClientTest(unittest.TestCase):
         body = json_dict(http.calls[0]["json_body"])
         self.assertIn("SourcegraphClientValidate", str(body.get("query") or ""))
         self.assertIn("currentUser", str(body.get("query") or ""))
+
+    def test_sourcegraph_trace_mode_records_and_streams_jaeger_summary(self) -> None:
+        trace_id = "1" * 32
+        span_id = "2" * 16
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path == "/.api/graphql":
+                return httpx.Response(
+                    200,
+                    json={"data": {"currentUser": {"username": "alice"}}},
+                    headers={
+                        "X-Trace": trace_id,
+                        "X-Trace-Span": span_id,
+                        "X-Trace-URL": f"https://jaeger.example.com/trace/{trace_id}",
+                    },
+                )
+            self.assertEqual(request.url.path, f"/-/debug/jaeger/api/traces/{trace_id}")
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "spans": [
+                                {
+                                    "operationName": "GraphQL request",
+                                    "duration": 120_000,
+                                    "tags": [{"key": "graphql.operationName", "value": "Viewer"}],
+                                },
+                                {
+                                    "operationName": "repo lookup",
+                                    "duration": 30_000,
+                                    "tags": [
+                                        {"key": "error", "value": True},
+                                        {"key": "otel.status_description", "value": "boom"},
+                                    ],
+                                },
+                            ]
+                        }
+                    ]
+                },
+            )
+
+        client = SourcegraphClient(
+            "https://sourcegraph.example.com/",
+            "token",
+            http=HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler)),
+            trace=True,
+        )
+        root_context = src.TraceContext(trace_id="3" * 32, span_id="4" * 16)
+
+        with src.trace_context(root_context):
+            self.assertEqual(
+                client.graphql("query Viewer { currentUser { username } }"),
+                {"currentUser": {"username": "alice"}},
+            )
+        traces = client.drain_traces()
+        summaries = list(client.stream_jaeger_trace_summaries(traces, retry_delays_seconds=(0,)))
+
+        self.assertEqual(len(requests), 2)
+        traceparent = requests[0].headers["traceparent"]
+        traceparent_parts = traceparent.split("-")
+        self.assertEqual(requests[0].headers["x-sourcegraph-request-trace"], "true")
+        self.assertRegex(traceparent, r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+        self.assertEqual(traceparent_parts[1], root_context.trace_id)
+        self.assertEqual(traces[0].trace_id, trace_id)
+        self.assertEqual(traces[0].span_id, span_id)
+        self.assertEqual(traces[0].parent_trace_id, root_context.trace_id)
+        self.assertEqual(traces[0].parent_span_id, traceparent_parts[2])
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0].jaeger_found)
+        self.assertEqual(summaries[0].span_count, 2)
+        self.assertEqual(summaries[0].hot_operations[0]["operation"], "GraphQL request")
+        self.assertEqual(summaries[0].graphql_operations[0]["operation"], "Viewer")
+        self.assertEqual(summaries[0].errored_spans[0]["description"], "boom")
 
     def test_graphql_client_paginates_cursor_results(self) -> None:
         http = RecordingHTTP(

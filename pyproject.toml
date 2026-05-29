@@ -45,7 +45,7 @@ Issues = "https://github.com/sourcegraph/src-py-lib/issues"
 packages = ["src/src_py_lib"]
 
 [tool.pyright]
-include = ["src/src_py_lib"]
+include = ["src/src_py_lib", "tests"]
 typeCheckingMode = "strict"
 extraPaths = ["src"]
 pythonVersion = "3.11"
