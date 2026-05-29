@@ -206,8 +206,29 @@ class SourcegraphClient:
             require_https=not self.allow_insecure_http,
         )
 
-    def graphql(self, query: str, variables: Mapping[str, JSONValue] | None = None) -> JSONDict:
-        return self._client().execute(query, variables)
+    def graphql(
+        self,
+        query: str,
+        variables: Mapping[str, JSONValue] | None = None,
+        *,
+        follow_pages: bool = True,
+        page_size: int | None = None,
+        first_variable: str = "first",
+        after_variable: str = "after",
+    ) -> JSONDict:
+        """Execute one Sourcegraph GraphQL operation.
+
+        Set `follow_pages=False` when the caller owns pagination, such as
+        aliased queries with one cursor per alias.
+        """
+        return self._client().execute(
+            query,
+            variables,
+            follow_pages=follow_pages,
+            page_size=page_size,
+            first_variable=first_variable,
+            after_variable=after_variable,
+        )
 
     def stream_connection_nodes(
         self,

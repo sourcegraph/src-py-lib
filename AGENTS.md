@@ -64,7 +64,7 @@ uv run python -m unittest discover -s tests
 ```sh
 set -euo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.6
 BRANCH="release-v${VERSION}"
 
 git fetch origin --tags --prune
@@ -116,7 +116,7 @@ rm -rf /tmp/src-py-lib-release-check
 ```sh
 set -euo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.6
 BRANCH="release-v${VERSION}"
 GH_REPO="sourcegraph/src-py-lib"
 
@@ -140,7 +140,7 @@ gh pr merge "${BRANCH}" --repo "${GH_REPO}" --squash --delete-branch
 ```sh
 set -euo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.6
 
 git fetch origin --tags --prune
 git switch main
@@ -154,7 +154,7 @@ git push origin "v${VERSION}"
 ```sh
 set -euo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.6
 GH_REPO="sourcegraph/src-py-lib"
 
 RUN_ID="$(

@@ -1424,6 +1424,35 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(http.calls[0]["url"], "https://sourcegraph.example.com/.api/graphql")
         self.assertEqual(http.calls[0]["headers"], {"Authorization": "token token"})
 
+    def test_sourcegraph_client_graphql_can_disable_auto_pagination(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "users": {
+                            "nodes": [{"username": "alice"}],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                }
+            ]
+        )
+        client = SourcegraphClient("https://sourcegraph.example.com", "token", http=http)
+        query = """
+query Users($first: Int!, $after: String) {
+  users(first: $first, after: $after) {
+    nodes { username }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+        data = client.graphql(query, page_size=1, follow_pages=False)
+
+        self.assertEqual(json_dict(data.get("users"))["nodes"], [{"username": "alice"}])
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(http.calls[0]["json_body"]["variables"], {"first": 1})
+
     def test_sourcegraph_client_rejects_http_endpoint_by_default(self) -> None:
         with self.assertRaisesRegex(ValueError, "https:// URL"):
             SourcegraphClient("http://sourcegraph.example.com", "token")
@@ -1536,7 +1565,7 @@ class ClientTest(unittest.TestCase):
 
         with src.trace_context(root_context):
             self.assertEqual(
-                client.graphql("query Viewer { currentUser { username } }"),
+                client.graphql("query Viewer { currentUser { username } }", follow_pages=False),
                 {"currentUser": {"username": "alice"}},
             )
         traces = client.drain_traces()
