@@ -176,6 +176,7 @@ __all__ = [
     "load_json_cache",
     "load_json_subset",
     "logging",
+    "logging_context",
     "logging_settings_from_config",
     "log",
     "log_context",

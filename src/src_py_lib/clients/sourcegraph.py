@@ -8,6 +8,7 @@ import json
 import queue
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Final, cast
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_lis
 from src_py_lib.utils.logging import (
     current_trace_context,
     new_trace_context,
+    submit_with_log_context,
     trace_context_from_traceparent,
     traceparent_header,
 )
@@ -244,13 +246,27 @@ class SourcegraphClient:
         traces: Iterable[SourcegraphTrace] | None = None,
         *,
         retry_delays_seconds: Sequence[float] = JAEGER_TRACE_RETRY_DELAYS_SECONDS,
+        parallelism: int = 8,
     ) -> Iterator[SourcegraphJaegerTraceSummary]:
         """Yield compact Jaeger/debug summaries for traced Sourcegraph requests."""
-        for trace in self.drain_traces() if traces is None else traces:
-            yield self.fetch_jaeger_trace_summary(
-                trace,
-                retry_delays_seconds=retry_delays_seconds,
-            )
+        if parallelism < 1:
+            raise ValueError("parallelism must be at least 1")
+        pending_traces = list(self.drain_traces() if traces is None else traces)
+        with ThreadPoolExecutor(
+            max_workers=parallelism,
+            thread_name_prefix="SourcegraphJaegerTrace",
+        ) as executor:
+            futures = [
+                submit_with_log_context(
+                    executor,
+                    self.fetch_jaeger_trace_summary,
+                    trace,
+                    retry_delays_seconds=retry_delays_seconds,
+                )
+                for trace in pending_traces
+            ]
+            for future in as_completed(futures):
+                yield future.result()
 
     def fetch_jaeger_trace_summary(
         self,
