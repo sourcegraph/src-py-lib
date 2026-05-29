@@ -1209,7 +1209,8 @@ class LoggingTest(unittest.TestCase):
                     "receive_response_headers.complete "
                     "return_value=(b'HTTP/1.1', 200, b'OK', "
                     "[(b'Zed', b'last'), (b'Content-Type', b'application/json'), "
-                    "(b'Alpha', b'first')])"
+                    "(b'Set-Cookie', b'session=secret'), "
+                    "(b'X-Api-Key', b'secret'), (b'Alpha', b'first')])"
                 )
             finally:
                 logger = logging.getLogger(logger_name)
@@ -1226,12 +1227,17 @@ class LoggingTest(unittest.TestCase):
             self.assertEqual(response_headers["http_version"], "HTTP/1.1")
             self.assertEqual(response_headers["status_code"], 200)
             self.assertEqual(response_headers["reason_phrase"], "OK")
-            self.assertEqual(list(response_headers["headers"]), ["alpha", "content-type", "zed"])
+            self.assertEqual(
+                list(response_headers["headers"]),
+                ["alpha", "content-type", "set-cookie", "x-api-key", "zed"],
+            )
             self.assertEqual(
                 response_headers["headers"],
                 {
                     "alpha": "first",
                     "content-type": "application/json",
+                    "set-cookie": "[redacted]",
+                    "x-api-key": "[redacted]",
                     "zed": "last",
                 },
             )
@@ -1311,8 +1317,9 @@ class HTTPClientTest(unittest.TestCase):
                 client = HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler))
                 payload = client.json(
                     "POST",
-                    "https://example.com/api",
+                    "https://user:pass@example.com/api?code=oauth",
                     headers={"Authorization": "Bearer token"},
+                    query={"limit": 10, "access_token": "secret", "signature": "signed"},
                     json_body={"hello": "world"},
                 )
             finally:
@@ -1332,6 +1339,11 @@ class HTTPClientTest(unittest.TestCase):
             self.assertFalse(any(row.get("logger") in {"httpx", "httpcore"} for row in rows))
             self.assertEqual(http_request["status_code"], 200)
             self.assertEqual(http_request["reason_phrase"], "OK")
+            self.assertEqual(
+                http_request["url"],
+                "https://example.com/api?code=[redacted]&limit=10"
+                "&access_token=[redacted]&signature=[redacted]",
+            )
             self.assertEqual(http_request["request_bytes"], len(b'{"hello": "world"}'))
             self.assertEqual(http_request["request_headers"]["authorization"], "[redacted]")
             self.assertEqual(
@@ -1364,10 +1376,13 @@ class HTTPClientTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(HTTPClientError, "rate limited") as raised:
-            client.json("GET", "https://example.com/api")
+            client.json("GET", "https://user:pass@example.com/api?access_token=secret")
 
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(raised.exception.body, "rate limited")
+        self.assertIn("https://example.com/api?access_token=[redacted]", str(raised.exception))
+        self.assertNotIn("user:pass", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
 
 
 class ClientTest(unittest.TestCase):
@@ -1408,6 +1423,13 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(http.calls[0]["method"], "POST")
         self.assertEqual(http.calls[0]["url"], "https://sourcegraph.example.com/.api/graphql")
         self.assertEqual(http.calls[0]["headers"], {"Authorization": "token token"})
+
+    def test_sourcegraph_client_rejects_http_endpoint_by_default(self) -> None:
+        with self.assertRaisesRegex(ValueError, "https:// URL"):
+            SourcegraphClient("http://sourcegraph.example.com", "token")
+
+        client = SourcegraphClient("http://localhost:3080", "token", allow_insecure_http=True)
+        self.assertEqual(client.endpoint, "http://localhost:3080")
 
     def test_sourcegraph_client_streams_connection_nodes(self) -> None:
         http = RecordingHTTP(
@@ -1780,7 +1802,12 @@ query Items($first: Int!, $after: String, $userId: ID!) {
                 },
             ]
         )
-        client = GraphQLClient("https://example.com/graphql", {}, "Example", http=http)
+        client = GraphQLClient(
+            "https://user:pass@example.com/graphql?access_token=secret&query=ok",
+            {},
+            "Example",
+            http=http,
+        )
         query = """
 query Items($first: Int!, $after: String, $userId: ID!) {
   viewer { items { nodes { id } pageInfo { hasNextPage endCursor } } }
@@ -1822,6 +1849,10 @@ query Items($first: Int!, $after: String, $userId: ID!) {
             self.assertEqual([row["page_size"] for row in starts], [2, 2])
             self.assertEqual([row["cursor_present"] for row in starts], [False, True])
             self.assertEqual(starts[0]["graphql_client"], "Example")
+            self.assertEqual(
+                starts[0]["url"],
+                "https://example.com/graphql?access_token=[redacted]&query=ok",
+            )
             self.assertEqual(starts[0]["variable_names"], ["after", "first", "userId"])
             self.assertEqual(ends[0]["response_fields"], ["viewer"])
 
@@ -1945,6 +1976,10 @@ query Items($first: Int!, $after: String) {
         self.assertEqual(
             graphql_api_url("github.example.com"), "https://github.example.com/api/graphql"
         )
+
+    def test_github_client_rejects_http_enterprise_url(self) -> None:
+        with self.assertRaisesRegex(ValueError, "https:// URL"):
+            graphql_api_url("http://github.example.com")
 
     def test_github_client_validate_queries_viewer(self) -> None:
         http = RecordingHTTP([{"data": {"viewer": {"login": "alice"}}}])

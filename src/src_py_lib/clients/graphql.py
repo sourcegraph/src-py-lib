@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
+from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse, log_safe_url
 from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list, json_str
 from src_py_lib.utils.logging import event
 
@@ -249,7 +249,7 @@ class GraphQLClient:
             page_number=page_number,
             page_size=_int_variable(variables, first_variable),
             cursor_present=variables.get(after_variable) is not None,
-            url=self.url,
+            url=log_safe_url(self.url),
             variable_names=sorted(variables),
             query_bytes=len(query.encode("utf-8")),
         ) as fields:

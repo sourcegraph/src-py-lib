@@ -113,6 +113,11 @@ def _normalize_github_url(github_url: str) -> str:
     stripped = github_url.strip().rstrip("/")
     if "://" not in stripped:
         stripped = f"https://{stripped}"
+    split = urlsplit(stripped)
+    if split.scheme != "https":
+        raise ValueError(f"GitHub URL must be an https:// URL (got {split.scheme!r})")
+    if not split.hostname:
+        raise ValueError(f"could not parse hostname from GitHub URL {stripped!r}")
     return stripped
 
 
