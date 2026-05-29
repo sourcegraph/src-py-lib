@@ -225,6 +225,7 @@ jobs:
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           release_tag="${{ github.event.inputs.tag || github.ref_name }}"
           notes_path="$(find release-assets -name release-notes.md -print -quit)"
