@@ -28,10 +28,10 @@ jobs:
     uses: ./.github/workflows/validate.yml
     with:
       ref: ${{ github.event.inputs.tag || github.ref }}
+      build-package: false
 
   wheel:
     name: Build wheel
-    needs: validate
     runs-on: ubuntu-24.04
     env:
       IMPORT_NAME: src_py_lib
@@ -53,7 +53,7 @@ jobs:
           cache: pip
 
       - name: Cache uv
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
@@ -61,9 +61,7 @@ jobs:
             uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
 
       - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "uv==${UV_VERSION}"
+        run: python -m pip install "uv==${UV_VERSION}"
 
       - name: Validate release inputs
         id: release
@@ -145,7 +143,6 @@ jobs:
         run: |
           python -m venv build/release/install-venv
           . build/release/install-venv/bin/activate
-          python -m pip install --upgrade pip
           python -m pip install "${{ steps.build.outputs.wheel_path }}"
           python - <<'PY'
           import os
@@ -213,22 +210,34 @@ jobs:
             ${{ steps.build.outputs.wheel_path }}
             ${{ steps.build.outputs.source_distribution_path }}
 
+  github-release:
+    name: Publish GitHub release assets
+    needs: [validate, wheel]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: src-py-lib-release
+          path: release-assets
+
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          release_tag="${{ steps.release.outputs.tag }}"
-          wheel_path="${{ steps.build.outputs.wheel_path }}"
-          source_distribution_path="${{ steps.build.outputs.source_distribution_path }}"
-          wheel_checksum_path="${{ steps.build.outputs.wheel_checksum_path }}"
-          source_distribution_checksum_path="${{ steps.build.outputs.source_distribution_checksum_path }}"
-          notes_path="${{ steps.notes.outputs.path }}"
-          release_assets=(
-            "${wheel_path}"
-            "${source_distribution_path}"
-            "${wheel_checksum_path}"
-            "${source_distribution_checksum_path}"
-          )
+          release_tag="${{ github.event.inputs.tag || github.ref_name }}"
+          notes_path="$(find release-assets -name release-notes.md -print -quit)"
+          mapfile -t release_assets < <(find release-assets -type f ! -name release-notes.md | sort)
+
+          if [[ -z "${notes_path}" ]]; then
+            echo "::error title=Missing release notes::release-notes.md was not found in release artifact."
+            exit 1
+          fi
+          if [[ "${#release_assets[@]}" -eq 0 ]]; then
+            echo "::error title=Missing release assets::No release assets were downloaded."
+            exit 1
+          fi
 
           if gh release view "${release_tag}" >/dev/null 2>&1; then
             gh release edit "${release_tag}" --title "${release_tag}" --notes-file "${notes_path}"
@@ -243,7 +252,7 @@ jobs:
 
   pypi:
     name: Publish PyPI package
-    needs: wheel
+    needs: [validate, wheel]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
