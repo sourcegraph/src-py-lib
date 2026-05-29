@@ -15,21 +15,86 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  package:
-    name: Validate package
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-24.04
+    outputs:
+      github_actions: ${{ steps.changed_paths.outputs.github_actions }}
+      markdown: ${{ steps.changed_paths.outputs.markdown }}
+      python: ${{ steps.changed_paths.outputs.python }}
+      package: ${{ steps.changed_paths.outputs.package }}
+
+    steps:
+      - name: Detect changed paths
+        id: changed_paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          github_actions_changed=false
+          markdown_changed=false
+          python_changed=false
+          package_changed=false
+
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            github_actions_changed=true
+            markdown_changed=true
+            python_changed=true
+            package_changed=true
+          else
+            changed_files="$(mktemp)"
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/files" \
+              --jq '.[].filename' > "${changed_files}"
+
+            while IFS= read -r changed_file; do
+              case "${changed_file}" in
+                .github/workflows/*)
+                  github_actions_changed=true
+                  ;;
+              esac
+
+              case "${changed_file}" in
+                *.md|.markdownlint-cli2.yaml)
+                  markdown_changed=true
+                  ;;
+              esac
+
+              case "${changed_file}" in
+                .python-version|pyproject.toml|uv.lock|src/*|tests/*)
+                  python_changed=true
+                  ;;
+              esac
+
+              case "${changed_file}" in
+                .python-version|LICENSE|README.md|pyproject.toml|uv.lock|src/*)
+                  package_changed=true
+                  ;;
+              esac
+            done < "${changed_files}"
+          fi
+
+          {
+            echo "github_actions=${github_actions_changed}"
+            echo "markdown=${markdown_changed}"
+            echo "python=${python_changed}"
+            echo "package=${package_changed}"
+          } >> "${GITHUB_OUTPUT}"
+
+  github_actions:
+    name: Lint GitHub Actions
+    needs: changes
+    if: needs.changes.outputs.github_actions == 'true'
     runs-on: ubuntu-24.04
     env:
       ACTIONLINT_VERSION: "1.7.12"
-      IMPORT_NAME: src_py_lib
-      MARKDOWNLINT_CLI2_VERSION: "0.22.1"
-      PYTHON_VERSION: "3.11"
-      UV_VERSION: "0.11.7"
 
     steps:
       - name: Check out code
@@ -38,15 +103,7 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Cache actionlint
-        id: cache-actionlint
-        uses: actions/cache@v5
-        with:
-          path: ~/.local/bin/actionlint
-          key: actionlint-${{ runner.os }}-${{ runner.arch }}-${{ env.ACTIONLINT_VERSION }}
-
       - name: Install actionlint
-        if: steps.cache-actionlint.outputs.cache-hit != 'true'
         run: |
           mkdir -p "${HOME}/.local/bin"
           asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
@@ -63,20 +120,45 @@ jobs:
         run: |
           "${HOME}/.local/bin/actionlint"
 
-      - name: Cache npm
-        uses: actions/cache@v5
+  markdown:
+    name: Lint Markdown
+    needs: changes
+    if: needs.changes.outputs.markdown == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      MARKDOWNLINT_CLI2_VERSION: "0.22.1"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
         with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-markdownlint-cli2-${{ env.MARKDOWNLINT_CLI2_VERSION }}
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Lint Markdown
         run: npx --yes "markdownlint-cli2@${MARKDOWNLINT_CLI2_VERSION}"
+
+  python:
+    name: Validate Python
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      IMPORT_NAME: src_py_lib
+      PYTHON_VERSION: "3.11"
+      UV_VERSION: "0.11.7"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
 
       - name: Cache uv
         uses: actions/cache@v5
@@ -115,12 +197,43 @@ jobs:
               raise SystemExit(f"unexpected import name: {src_py_lib.__name__}")
           PY
 
+  package_build:
+    name: Build and smoke-test package
+    needs: changes
+    if: inputs.build-package && needs.changes.outputs.package == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      IMPORT_NAME: src_py_lib
+      PYTHON_VERSION: "3.11"
+      UV_VERSION: "0.11.7"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
+
+      - name: Install uv
+        run: python -m pip install "uv==${UV_VERSION}"
+
       - name: Build wheel
-        if: inputs.build-package
         run: uv build --wheel --out-dir dist --no-create-gitignore
 
       - name: Smoke test installed wheel
-        if: inputs.build-package
         run: |
           python -m venv build/ci-venv
           . build/ci-venv/bin/activate
@@ -133,3 +246,29 @@ jobs:
           if src_py_lib.__name__ != os.environ["IMPORT_NAME"]:
               raise SystemExit(f"unexpected import name: {src_py_lib.__name__}")
           PY
+
+  package:
+    name: Validate package
+    needs: [changes, github_actions, markdown, python, package_build]
+    if: always()
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Confirm validation results
+        run: |
+          for validation_result in \
+            "${{ needs.changes.result }}" \
+            "${{ needs.github_actions.result }}" \
+            "${{ needs.markdown.result }}" \
+            "${{ needs.python.result }}" \
+            "${{ needs.package_build.result }}"
+          do
+            case "${validation_result}" in
+              success|skipped)
+                ;;
+              *)
+                echo "::error title=Validation failed::At least one validation job ended with '${validation_result}'."
+                exit 1
+                ;;
+            esac
+          done
