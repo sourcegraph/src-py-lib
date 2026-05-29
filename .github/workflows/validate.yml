@@ -20,7 +20,9 @@ jobs:
     name: Validate package
     runs-on: ubuntu-24.04
     env:
+      ACTIONLINT_VERSION: "1.7.12"
       IMPORT_NAME: src_py_lib
+      MARKDOWNLINT_CLI2_VERSION: "0.22.1"
       PYTHON_VERSION: "3.11"
       UV_VERSION: "0.11.7"
 
@@ -31,11 +33,46 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Cache actionlint
+        id: cache-actionlint
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/actionlint
+          key: actionlint-${{ runner.os }}-${{ runner.arch }}-${{ env.ACTIONLINT_VERSION }}
+
+      - name: Install actionlint
+        if: steps.cache-actionlint.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${HOME}/.local/bin"
+          go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
+          install -m 0755 "${HOME}/go/bin/actionlint" "${HOME}/.local/bin/actionlint"
+
+      - name: Lint GitHub Actions
+        run: |
+          "${HOME}/.local/bin/actionlint"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-markdownlint-cli2-${{ env.MARKDOWNLINT_CLI2_VERSION }}
+
+      - name: Lint Markdown
+        run: npx --yes "markdownlint-cli2@${MARKDOWNLINT_CLI2_VERSION}"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
 
       - name: Install uv
         run: |
@@ -44,9 +81,6 @@ jobs:
 
       - name: Validate lockfile
         run: uv lock --check
-
-      - name: Lint Markdown
-        run: npx --yes markdownlint-cli2
 
       - name: Lint Python
         run: uv run --frozen ruff check .
@@ -88,9 +122,3 @@ jobs:
           if src_py_lib.__name__ != os.environ["IMPORT_NAME"]:
               raise SystemExit(f"unexpected import name: {src_py_lib.__name__}")
           PY
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: src-py-lib-wheel
-          path: dist/*.whl

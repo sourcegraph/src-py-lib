@@ -14,7 +14,8 @@
 ## Standard commands
 
 ```sh
-npx --yes markdownlint-cli2
+actionlint
+npx --yes markdownlint-cli2@0.22.1
 uv sync
 uv run ruff format .
 uv run ruff check .
@@ -99,7 +100,8 @@ uv lock
 set -euo pipefail
 
 uv lock --check
-npx --yes markdownlint-cli2
+actionlint
+npx --yes markdownlint-cli2@0.22.1
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
