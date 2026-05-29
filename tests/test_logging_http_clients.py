@@ -8,6 +8,7 @@ import json
 import logging
 import subprocess
 import tempfile
+import threading
 import unittest
 from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
@@ -36,6 +37,7 @@ from src_py_lib.clients.slack import SlackClient
 from src_py_lib.clients.sourcegraph import (
     SourcegraphClient,
     SourcegraphClientConfig,
+    SourcegraphTrace,
     decode_external_service_id,
     decode_repository_id,
     encode_repository_id,
@@ -1534,6 +1536,50 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(summaries[0].hot_operations[0]["operation"], "GraphQL request")
         self.assertEqual(summaries[0].graphql_operations[0]["operation"], "Viewer")
         self.assertEqual(summaries[0].errored_spans[0]["description"], "boom")
+
+    def test_sourcegraph_streams_jaeger_summaries_in_parallel(self) -> None:
+        trace_ids = ("1" * 32, "2" * 32, "3" * 32)
+        requested_trace_ids: list[str] = []
+        first_batch_barrier = threading.Barrier(2, timeout=1)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            trace_id = request.url.path.rsplit("/", 1)[-1]
+            requested_trace_ids.append(trace_id)
+            if trace_id in trace_ids[:2]:
+                first_batch_barrier.wait()
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "spans": [
+                                {
+                                    "operationName": f"trace {trace_id[0]}",
+                                    "duration": 1_000,
+                                    "tags": [],
+                                }
+                            ]
+                        }
+                    ]
+                },
+            )
+
+        client = SourcegraphClient(
+            "https://sourcegraph.example.com/",
+            "token",
+            http=HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler)),
+        )
+
+        summaries = list(
+            client.stream_jaeger_trace_summaries(
+                [SourcegraphTrace(trace_id) for trace_id in trace_ids],
+                retry_delays_seconds=(0,),
+                parallelism=2,
+            )
+        )
+
+        self.assertCountEqual(requested_trace_ids, trace_ids)
+        self.assertCountEqual([summary.trace.trace_id for summary in summaries], trace_ids)
 
     def test_graphql_client_paginates_cursor_results(self) -> None:
         http = RecordingHTTP(
