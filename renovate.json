@@ -10,5 +10,8 @@
       ],
       "allowedVersions": "<3.12"
     }
+  ],
+  "schedule": [
+    "at any time"
   ]
 }
