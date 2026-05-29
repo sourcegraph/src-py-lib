@@ -93,21 +93,28 @@ jobs:
               raise SystemExit(f"unexpected import name: {src_py_lib.__name__}")
           PY
 
-      - name: Build wheel
+      - name: Build distributions
         id: build
         run: |
           dist_dir="build/release/dist"
           rm -rf build/release
           mkdir -p "${dist_dir}"
+          shopt -s nullglob
 
-          uv build --wheel --out-dir "${dist_dir}" --no-create-gitignore
+          uv build --wheel --sdist --out-dir "${dist_dir}" --no-create-gitignore
           project_wheels=("${dist_dir}"/*.whl)
           if [[ "${#project_wheels[@]}" -ne 1 ]]; then
             echo "::error title=Unexpected wheel count::Expected one project wheel, found ${#project_wheels[@]}."
             exit 1
           fi
+          source_distributions=("${dist_dir}"/*.tar.gz)
+          if [[ "${#source_distributions[@]}" -ne 1 ]]; then
+            echo "::error title=Unexpected source distribution count::Expected one source distribution, found ${#source_distributions[@]}."
+            exit 1
+          fi
           wheel_path="${project_wheels[0]}"
           wheel_name="$(basename "${wheel_path}")"
+          source_distribution_path="${source_distributions[0]}"
           checksum_path="${wheel_path}.sha256"
 
           (
@@ -117,6 +124,7 @@ jobs:
 
           echo "wheel_path=${wheel_path}" >> "${GITHUB_OUTPUT}"
           echo "wheel_name=${wheel_name}" >> "${GITHUB_OUTPUT}"
+          echo "source_distribution_path=${source_distribution_path}" >> "${GITHUB_OUTPUT}"
           echo "checksum_path=${checksum_path}" >> "${GITHUB_OUTPUT}"
 
       - name: Smoke test installed wheel
@@ -178,7 +186,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pypi-distributions
-          path: ${{ steps.build.outputs.wheel_path }}
+          path: |
+            ${{ steps.build.outputs.wheel_path }}
+            ${{ steps.build.outputs.source_distribution_path }}
 
       - name: Publish GitHub release assets
         env:
