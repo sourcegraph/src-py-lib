@@ -182,6 +182,9 @@ class SourcegraphClient:
     `endpoint` should be the instance base URL, for example
     `https://sourcegraph.example.com`.
 
+    Plain HTTP endpoints are rejected unless `allow_insecure_http=True` is set
+    for local development.
+
     Set `trace=True` to ask Sourcegraph to retain traces for each GraphQL
     request. Traced requests are available through `drain_traces()` and can be
     fetched from the instance's Jaeger/debug endpoint with
@@ -192,12 +195,16 @@ class SourcegraphClient:
     token: str
     http: HTTPClient = field(default_factory=HTTPClient)
     trace: bool = False
+    allow_insecure_http: bool = False
     _traces: queue.Queue[SourcegraphTrace] = field(
         default_factory=lambda: queue.Queue[SourcegraphTrace](), init=False, repr=False
     )
 
     def __post_init__(self) -> None:
-        self.endpoint = normalize_sourcegraph_endpoint(self.endpoint)
+        self.endpoint = normalize_sourcegraph_endpoint(
+            self.endpoint,
+            require_https=not self.allow_insecure_http,
+        )
 
     def graphql(self, query: str, variables: Mapping[str, JSONValue] | None = None) -> JSONDict:
         return self._client().execute(query, variables)

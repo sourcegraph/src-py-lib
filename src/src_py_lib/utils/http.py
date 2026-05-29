@@ -33,6 +33,19 @@ SENSITIVE_HEADER_FRAGMENTS: Final[tuple[str, ...]] = (
     "secret",
     "token",
 )
+SENSITIVE_URL_QUERY_FRAGMENTS: Final[tuple[str, ...]] = (
+    "access_token",
+    "api-key",
+    "api_key",
+    "authorization",
+    "code",
+    "credential",
+    "key",
+    "password",
+    "secret",
+    "signature",
+    "token",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +163,7 @@ class HTTPClient:
                     "http_request",
                     level="debug",
                     method=method,
-                    url=_safe_url(request_url),
+                    url=log_safe_url(request_url),
                     attempt=attempt,
                     request_headers=_headers_for_log(request_headers),
                     request_bytes=len(body or b""),
@@ -179,7 +192,7 @@ class HTTPClient:
                         if not self._should_retry(response.status_code, attempt):
                             raise HTTPClientError(
                                 f"HTTP {response.status_code} for {method} "
-                                f"{_safe_url(request_url)}: {body_text}",
+                                f"{log_safe_url(request_url)}: {body_text}",
                                 status_code=response.status_code,
                                 body=body_text,
                                 headers=dict(response.headers),
@@ -203,7 +216,7 @@ class HTTPClient:
                         "timed out" if isinstance(exception, httpx.TimeoutException) else "failed"
                     )
                     raise HTTPClientError(
-                        f"HTTP request {failure} for {method} {_safe_url(request_url)}: "
+                        f"HTTP request {failure} for {method} {log_safe_url(request_url)}: "
                         f"{_exception_message(exception)}"
                     ) from exception
                 record_http_retry()
@@ -246,7 +259,7 @@ class HTTPClient:
             ), response
         except json.JSONDecodeError as exception:
             raise HTTPClientError(
-                f"Invalid JSON response from {method} {_safe_url(url)}"
+                f"Invalid JSON response from {method} {log_safe_url(url)}"
             ) from exception
 
     def _should_retry(self, status_code: int | None, attempt: int) -> bool:
@@ -276,9 +289,31 @@ def _with_query(
     return f"{url}{separator}{urllib.parse.urlencode(filtered)}"
 
 
-def _safe_url(url: str) -> str:
+def log_safe_url(url: str) -> str:
+    """Return a URL safe to include in logs and exception messages."""
     split = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((split.scheme, split.netloc, split.path, split.query, ""))
+    return urllib.parse.urlunsplit(
+        (split.scheme, _safe_netloc(split.netloc), split.path, _safe_query(split.query), "")
+    )
+
+
+def _safe_netloc(netloc: str) -> str:
+    return netloc.rsplit("@", 1)[-1]
+
+
+def _safe_query(query: str) -> str:
+    if not query:
+        return ""
+    parts: list[str] = []
+    for part in query.split("&"):
+        key, separator, _value = part.partition("=")
+        if _is_sensitive_query_parameter(urllib.parse.unquote_plus(key)):
+            parts.append(f"{key}={REDACTED_HEADER_VALUE}")
+        elif separator:
+            parts.append(part)
+        else:
+            parts.append(key)
+    return "&".join(parts)
 
 
 def _headers_for_log(headers: Mapping[str, str] | httpx.Headers) -> dict[str, str | list[str]]:
@@ -309,6 +344,11 @@ def _response_headers(headers: httpx.Headers) -> dict[str, str]:
 def _is_sensitive_header(name: str) -> bool:
     lowered = name.lower()
     return any(fragment in lowered for fragment in SENSITIVE_HEADER_FRAGMENTS)
+
+
+def _is_sensitive_query_parameter(name: str) -> bool:
+    lowered = name.lower()
+    return any(fragment in lowered for fragment in SENSITIVE_URL_QUERY_FRAGMENTS)
 
 
 def _response_http_version(response: httpx.Response) -> str | None:

@@ -43,7 +43,9 @@ SRC_LOG_SILENT: Final[str] = "SRC_LOG_SILENT"
 TRACE_ID_BYTES: Final[int] = 16
 SPAN_ID_BYTES: Final[int] = 8
 MEBIBYTE: Final[int] = 1024 * 1024
+REDACTED_LOG_VALUE: Final[str] = "[redacted]"
 SECRET_FIELD_FRAGMENTS: Final[tuple[str, ...]] = (
+    "api-key",
     "api_key",
     "authorization",
     "cookie",
@@ -768,7 +770,7 @@ def sanitized_config_snapshot(config: object) -> dict[str, Any]:
         if callable(value):
             continue
         key_text = str(key)
-        if any(fragment in key_text.lower() for fragment in SECRET_FIELD_FRAGMENTS):
+        if _is_sensitive_log_field(key_text):
             snapshot[key_text] = _secret_state(value)
         elif isinstance(value, Path):
             snapshot[key_text] = str(value)
@@ -937,13 +939,14 @@ def _http_headers(raw_headers: object) -> dict[str, str | list[str]]:
         if name is None or value is None:
             continue
         key = name.lower()
+        logged_value = REDACTED_LOG_VALUE if _is_sensitive_log_field(key) else value
         existing = headers.get(key)
         if existing is None:
-            headers[key] = value
+            headers[key] = logged_value
         elif isinstance(existing, list):
-            existing.append(value)
+            existing.append(logged_value)
         else:
-            headers[key] = [existing, value]
+            headers[key] = [existing, logged_value]
     return {key: headers[key] for key in sorted(headers)}
 
 
@@ -969,6 +972,11 @@ def _is_hex_identifier(value: str, length: int) -> bool:
         and any(character != "0" for character in lowered)
         and all(character in "0123456789abcdef" for character in lowered)
     )
+
+
+def _is_sensitive_log_field(name: str) -> bool:
+    lowered = name.lower()
+    return any(fragment in lowered for fragment in SECRET_FIELD_FRAGMENTS)
 
 
 def _secret_state(value: object) -> str:
