@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import collections
 import json
 import queue
-import secrets
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,8 +16,16 @@ from src_py_lib.clients.graphql import GraphQLClient, stream_connection_nodes
 from src_py_lib.utils.config import Config, config_field
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list
+from src_py_lib.utils.logging import (
+    current_trace_context,
+    new_trace_context,
+    trace_context_from_traceparent,
+    traceparent_header,
+)
 
 DEFAULT_SOURCEGRAPH_ENDPOINT = "https://sourcegraph.com"
+SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE: Final[str] = "ExternalService"
+SOURCEGRAPH_REPOSITORY_NODE_TYPE: Final[str] = "Repository"
 REQUEST_TRACE_HEADER: Final[str] = "X-Sourcegraph-Request-Trace"
 TRACEPARENT_HEADER: Final[str] = "traceparent"
 TRACE_ID_RESPONSE_HEADER: Final[str] = "x-trace"
@@ -104,6 +112,44 @@ def normalize_sourcegraph_endpoint(endpoint: str, *, require_https: bool = False
             f"could not parse hostname from Sourcegraph endpoint {normalized_endpoint!r}"
         )
     return normalized_endpoint
+
+
+def encode_sourcegraph_node_id(node_type: str, database_id: int) -> str:
+    """Return a Sourcegraph opaque GraphQL Node ID for `node_type:database_id`."""
+    raw = f"{node_type}:{database_id}".encode()
+    return base64.b64encode(raw).decode()
+
+
+def decode_sourcegraph_node_id(node_type: str, graphql_id: str) -> int:
+    """Return the database ID from a Sourcegraph opaque GraphQL Node ID."""
+    try:
+        raw = base64.b64decode(graphql_id, validate=True).decode()
+    except (ValueError, UnicodeDecodeError) as exception:
+        raise ValueError(f"not a valid base64 GraphQL Node ID: {graphql_id!r}") from exception
+    decoded_node_type, separator, database_id = raw.partition(":")
+    if not separator or decoded_node_type != node_type:
+        raise ValueError(f"not a {node_type} Node ID: {graphql_id!r} (decoded: {raw!r})")
+    try:
+        return int(database_id)
+    except ValueError as exception:
+        raise ValueError(
+            f"{node_type} Node ID has non-integer suffix: {graphql_id!r} (decoded: {raw!r})"
+        ) from exception
+
+
+def decode_external_service_id(graphql_id: str) -> int:
+    """Return the database ID from an opaque ExternalService GraphQL Node ID."""
+    return decode_sourcegraph_node_id(SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE, graphql_id)
+
+
+def encode_repository_id(database_id: int) -> str:
+    """Return an opaque Repository GraphQL Node ID from a database ID."""
+    return encode_sourcegraph_node_id(SOURCEGRAPH_REPOSITORY_NODE_TYPE, database_id)
+
+
+def decode_repository_id(graphql_id: str) -> int:
+    """Return the database ID from an opaque Repository GraphQL Node ID."""
+    return decode_sourcegraph_node_id(SOURCEGRAPH_REPOSITORY_NODE_TYPE, graphql_id)
 
 
 class SourcegraphClientConfig(Config):
@@ -273,7 +319,9 @@ class SourcegraphClient:
         headers = self._authorization_headers()
         if self.trace:
             headers[REQUEST_TRACE_HEADER] = "true"
-            headers[TRACEPARENT_HEADER] = sampled_traceparent()
+            headers[TRACEPARENT_HEADER] = traceparent_header(
+                current_trace_context() or new_trace_context()
+            )
         return headers
 
     def _record_trace_response(
@@ -300,16 +348,8 @@ def sourcegraph_client_from_config(
 
 
 def sampled_traceparent() -> str:
-    """Return a sampled W3C traceparent header with non-zero identifiers."""
-    return f"00-{nonzero_hex(16)}-{nonzero_hex(8)}-01"
-
-
-def nonzero_hex(byte_count: int) -> str:
-    """Return a random hex string that is not all zeroes."""
-    while True:
-        value = secrets.token_hex(byte_count)
-        if any(character != "0" for character in value):
-            return value
+    """Compatibility wrapper for sampled W3C traceparent generation."""
+    return traceparent_header(sampled=True)
 
 
 def sourcegraph_trace_from_headers(
@@ -321,30 +361,14 @@ def sourcegraph_trace_from_headers(
         return None
     span_id = header_value(response_headers, TRACE_SPAN_RESPONSE_HEADER)
     trace_url = header_value(response_headers, TRACE_URL_RESPONSE_HEADER)
-    parent_trace_id, parent_span_id = traceparent_ids(
-        header_value(request_headers, TRACEPARENT_HEADER)
-    )
+    parent = trace_context_from_traceparent(header_value(request_headers, TRACEPARENT_HEADER))
     return SourcegraphTrace(
         trace_id=trace_id.lower(),
         span_id=span_id.lower() if span_id and is_hex_identifier(span_id, 16) else span_id,
         trace_url=trace_url,
-        parent_trace_id=parent_trace_id,
-        parent_span_id=parent_span_id,
+        parent_trace_id=parent.trace_id if parent is not None else None,
+        parent_span_id=parent.span_id if parent is not None else None,
     )
-
-
-def traceparent_ids(value: str | None) -> tuple[str | None, str | None]:
-    """Return trace/span identifiers from a W3C traceparent header."""
-    if value is None:
-        return None, None
-    parts = value.split("-")
-    if len(parts) != 4:
-        return None, None
-    trace_id = parts[1].lower()
-    span_id = parts[2].lower()
-    if not is_hex_identifier(trace_id, 32) or not is_hex_identifier(span_id, 16):
-        return None, None
-    return trace_id, span_id
 
 
 def is_hex_identifier(value: str, length: int) -> bool:

@@ -62,6 +62,14 @@ jobs:
             echo "::error title=Missing tag::Tag '${release_tag}' was not fetched. Create and push it before running this workflow."
             exit 1
           fi
+          tag_revision="$(git rev-list -n 1 "${release_tag}")"
+          git fetch --no-tags origin main
+          main_revision="$(git rev-parse origin/main)"
+          if ! git merge-base --is-ancestor "${tag_revision}" "${main_revision}"; then
+            echo "::error title=Tag is not on main::Tag '${release_tag}' points at ${tag_revision}, which is not reachable from origin/main."
+            echo "::error::Merge the release PR first, then tag the main commit."
+            exit 1
+          fi
 
           project_version=$(uv run --frozen python - <<'PY'
           import tomllib

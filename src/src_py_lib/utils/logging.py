@@ -40,7 +40,8 @@ SRC_LOG_LEVEL: Final[str] = "SRC_LOG_LEVEL"
 SRC_LOG_VERBOSE: Final[str] = "SRC_LOG_VERBOSE"
 SRC_LOG_QUIET: Final[str] = "SRC_LOG_QUIET"
 SRC_LOG_SILENT: Final[str] = "SRC_LOG_SILENT"
-TRACE_SPAN_BYTES: Final[int] = 4
+TRACE_ID_BYTES: Final[int] = 16
+SPAN_ID_BYTES: Final[int] = 8
 MEBIBYTE: Final[int] = 1024 * 1024
 SECRET_FIELD_FRAGMENTS: Final[tuple[str, ...]] = (
     "api_key",
@@ -188,13 +189,48 @@ def logging_settings_from_config(
 
 
 @dataclass(frozen=True)
-class _SpanContext:
-    trace: str
-    span: str
-    parent_span: str | None = None
+class TraceContext:
+    """W3C-compatible trace/span identifiers for logs and outbound requests."""
+
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _is_hex_identifier(self.trace_id, TRACE_ID_BYTES * 2):
+            raise ValueError("trace_id must be a non-zero 32-character hex string")
+        if not _is_hex_identifier(self.span_id, SPAN_ID_BYTES * 2):
+            raise ValueError("span_id must be a non-zero 16-character hex string")
+        if self.parent_span_id is not None and not _is_hex_identifier(
+            self.parent_span_id, SPAN_ID_BYTES * 2
+        ):
+            raise ValueError("parent_span_id must be a non-zero 16-character hex string")
+
+    @property
+    def trace(self) -> str:
+        """Return the log-field trace identifier."""
+        return self.trace_id
+
+    @property
+    def span(self) -> str:
+        """Return the log-field span identifier."""
+        return self.span_id
+
+    @property
+    def parent_span(self) -> str | None:
+        """Return the log-field parent span identifier."""
+        return self.parent_span_id
+
+    def child(self) -> TraceContext:
+        """Return a child span in the same trace."""
+        return new_trace_context(self)
+
+    def traceparent(self, *, sampled: bool = True) -> str:
+        """Return this context as a W3C traceparent header value."""
+        return traceparent_header(self, sampled=sampled)
 
 
-_SPAN_CONTEXT: contextvars.ContextVar[_SpanContext | None] = contextvars.ContextVar(
+_SPAN_CONTEXT: contextvars.ContextVar[TraceContext | None] = contextvars.ContextVar(
     "src_py_lib_span_context", default=None
 )
 
@@ -597,6 +633,68 @@ def stage(name: str, **fields: Any) -> Generator[None]:
         yield
 
 
+def current_trace_context() -> TraceContext | None:
+    """Return the current logging trace/span context, if one is active."""
+    return _SPAN_CONTEXT.get()
+
+
+def new_trace_context(parent: TraceContext | None = None) -> TraceContext:
+    """Return a root or child trace/span context.
+
+    When `parent` is omitted, the current context is used as the parent when
+    available. Otherwise a new root trace is created.
+    """
+    resolved_parent = parent if parent is not None else current_trace_context()
+    if resolved_parent is None:
+        return TraceContext(
+            trace_id=_nonzero_hex(TRACE_ID_BYTES),
+            span_id=_nonzero_hex(SPAN_ID_BYTES),
+        )
+    return TraceContext(
+        trace_id=resolved_parent.trace_id,
+        span_id=_nonzero_hex(SPAN_ID_BYTES),
+        parent_span_id=resolved_parent.span_id,
+    )
+
+
+@contextlib.contextmanager
+def trace_context(context: TraceContext | None = None) -> Generator[TraceContext]:
+    """Set a trace/span context for nested logs and outbound requests."""
+    resolved_context = context or new_trace_context()
+    reset_token = _SPAN_CONTEXT.set(resolved_context)
+    try:
+        yield resolved_context
+    finally:
+        _SPAN_CONTEXT.reset(reset_token)
+
+
+def traceparent_header(context: TraceContext | None = None, *, sampled: bool = True) -> str:
+    """Return a W3C traceparent header for `context` or the current context."""
+    resolved_context = context or current_trace_context() or new_trace_context()
+    flags = "01" if sampled else "00"
+    return f"00-{resolved_context.trace_id}-{resolved_context.span_id}-{flags}"
+
+
+def sampled_traceparent(context: TraceContext | None = None) -> str:
+    """Return a sampled W3C traceparent header value."""
+    return traceparent_header(context, sampled=True)
+
+
+def trace_context_from_traceparent(value: str | None) -> TraceContext | None:
+    """Return trace/span identifiers parsed from a W3C traceparent header."""
+    if value is None:
+        return None
+    parts = value.split("-")
+    if len(parts) != 4 or parts[0] != "00":
+        return None
+    trace_id = parts[1].lower()
+    span_id = parts[2].lower()
+    try:
+        return TraceContext(trace_id=trace_id, span_id=span_id)
+    except ValueError:
+        return None
+
+
 @contextlib.contextmanager
 def event(
     key: str,
@@ -608,12 +706,7 @@ def event(
     **fields: Any,
 ) -> Generator[dict[str, Any]]:
     """Emit start/end structured events around a block of work."""
-    parent = _SPAN_CONTEXT.get()
-    span = _SpanContext(
-        trace=parent.trace if parent else secrets.token_hex(TRACE_SPAN_BYTES),
-        span=secrets.token_hex(TRACE_SPAN_BYTES),
-        parent_span=parent.span if parent else None,
-    )
+    span = new_trace_context()
     reset_token = _SPAN_CONTEXT.set(span)
     try:
         log(start_level or level, key, logger_name=logger_name, phase="start", **fields)
@@ -860,6 +953,22 @@ def _decode_http_bytes(value: object) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _nonzero_hex(byte_count: int) -> str:
+    while True:
+        value = secrets.token_hex(byte_count)
+        if any(character != "0" for character in value):
+            return value
+
+
+def _is_hex_identifier(value: str, length: int) -> bool:
+    lowered = value.lower()
+    return (
+        len(lowered) == length
+        and any(character != "0" for character in lowered)
+        and all(character in "0123456789abcdef" for character in lowered)
+    )
 
 
 def _secret_state(value: object) -> str:

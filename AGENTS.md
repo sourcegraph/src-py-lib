@@ -56,6 +56,9 @@ uv run python -m unittest discover -s tests
   verifies that it matches `project.version` before building GitHub release
   assets and publishing to PyPI.
 - Prepare releases on a branch from current `main`. Set `VERSION`, then run:
+- As part of every release bump, find old release-version literals in
+  `AGENTS.md`, `README.md`, and release snippets, and replace them with the
+  new version where they are meant to stay current.
 
 ```sh
 set -euo pipefail
