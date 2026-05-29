@@ -9,11 +9,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list, json_str
 from src_py_lib.utils.logging import event
 
 _OPERATION_NAME_RE = re.compile(r"\b(?:query|mutation|subscription)\s+(\w+)")
+HeaderProvider = Mapping[str, str] | Callable[[], Mapping[str, str]]
+GraphQLResponseHook = Callable[[HTTPResponse, Mapping[str, str]], None]
 
 GRAPHQL_INTROSPECTION_QUERY = """
 query IntrospectionQuery {
@@ -130,10 +132,11 @@ class GraphQLClient:
     """POST JSON GraphQL operations and return the `data` object."""
 
     url: str
-    headers: dict[str, str]
+    headers: HeaderProvider
     label: str
     http: HTTPClient = field(default_factory=HTTPClient)
     tolerate_partial_errors: bool = False
+    response_hook: GraphQLResponseHook | None = None
 
     def execute(
         self,
@@ -251,7 +254,16 @@ class GraphQLClient:
             query_bytes=len(query.encode("utf-8")),
         ) as fields:
             try:
-                payload = self.http.json("POST", self.url, headers=self.headers, json_body=body)
+                request_headers = self._headers()
+                if self.response_hook is None:
+                    payload = self.http.json(
+                        "POST", self.url, headers=request_headers, json_body=body
+                    )
+                else:
+                    payload, response = self.http.json_response(
+                        "POST", self.url, headers=request_headers, json_body=body
+                    )
+                    self.response_hook(response, request_headers)
             except HTTPClientError as exception:
                 raise GraphQLError(
                     f"{self.label} GraphQL request failed: {exception}",
@@ -268,6 +280,11 @@ class GraphQLClient:
                     is_application_error=True,
                 )
             return data
+
+    def _headers(self) -> dict[str, str]:
+        if callable(self.headers):
+            return dict(self.headers())
+        return dict(self.headers)
 
 
 def operation_name(query: str) -> str:

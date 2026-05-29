@@ -54,6 +54,21 @@ class HTTPClientError(RuntimeError):
         self.headers = {key.lower(): value for key, value in dict(headers or {}).items()}
 
 
+@dataclass(frozen=True)
+class HTTPResponse:
+    """HTTP response data returned by `HTTPClient`."""
+
+    status_code: int
+    reason_phrase: str
+    headers: dict[str, str]
+    content: bytes
+    http_version: str | None = None
+
+    def header(self, name: str) -> str | None:
+        """Return one response header by case-insensitive name."""
+        return self.headers.get(name.lower())
+
+
 @dataclass
 class HTTPClient:
     """HTTPX-backed HTTP client for JSON APIs with pooled connections."""
@@ -103,6 +118,26 @@ class HTTPClient:
         data: bytes | None = None,
     ) -> bytes:
         """Make an HTTP request and return raw response bytes."""
+        return self.response(
+            method,
+            url,
+            headers=headers,
+            query=query,
+            json_body=json_body,
+            data=data,
+        ).content
+
+    def response(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        query: Mapping[str, str | int | float | bool | None] | None = None,
+        json_body: object | None = None,
+        data: bytes | None = None,
+    ) -> HTTPResponse:
+        """Make an HTTP request and return response headers plus raw bytes."""
         request_url = _with_query(url, query)
         body = data
         request_headers = {"User-Agent": self.user_agent, **dict(headers or {})}
@@ -152,7 +187,13 @@ class HTTPClient:
                         record_http_retry()
                         self._sleep_before_retry(attempt, response.headers.get("Retry-After"))
                     else:
-                        return payload
+                        return HTTPResponse(
+                            status_code=response.status_code,
+                            reason_phrase=response.reason_phrase,
+                            headers=_response_headers(response.headers),
+                            content=payload,
+                            http_version=http_version,
+                        )
             except HTTPClientError:
                 raise
             except httpx.TransportError as exception:
@@ -179,9 +220,30 @@ class HTTPClient:
         json_body: object | None = None,
     ) -> JSONDict:
         """Make an HTTP request and decode a JSON object response."""
-        raw = self.request(method, url, headers=headers, query=query, json_body=json_body)
+        payload, _response = self.json_response(
+            method,
+            url,
+            headers=headers,
+            query=query,
+            json_body=json_body,
+        )
+        return payload
+
+    def json_response(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        query: Mapping[str, str | int | float | bool | None] | None = None,
+        json_body: object | None = None,
+    ) -> tuple[JSONDict, HTTPResponse]:
+        """Make an HTTP request and return a JSON object plus response metadata."""
+        response = self.response(method, url, headers=headers, query=query, json_body=json_body)
         try:
-            return json_dict(json.loads(raw.decode("utf-8")) if raw else {})
+            return json_dict(
+                json.loads(response.content.decode("utf-8")) if response.content else {}
+            ), response
         except json.JSONDecodeError as exception:
             raise HTTPClientError(
                 f"Invalid JSON response from {method} {_safe_url(url)}"
@@ -238,6 +300,10 @@ def _header_items(headers: Mapping[str, str] | httpx.Headers) -> Iterable[tuple[
     if isinstance(headers, httpx.Headers):
         return headers.multi_items()
     return headers.items()
+
+
+def _response_headers(headers: httpx.Headers) -> dict[str, str]:
+    return {name.lower(): value for name, value in headers.items()}
 
 
 def _is_sensitive_header(name: str) -> bool:

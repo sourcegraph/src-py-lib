@@ -37,7 +37,11 @@ from src_py_lib.clients.slack import (
 from src_py_lib.clients.sourcegraph import (
     SourcegraphClient,
     SourcegraphClientConfig,
+    SourcegraphJaegerTraceError,
+    SourcegraphJaegerTraceSummary,
+    SourcegraphTrace,
     normalize_sourcegraph_endpoint,
+    sampled_traceparent,
     sourcegraph_client_from_config,
 )
 from src_py_lib.utils.config import (
@@ -49,7 +53,7 @@ from src_py_lib.utils.config import (
 from src_py_lib.utils.config import (
     config_parse_args as parse_args,
 )
-from src_py_lib.utils.http import HTTPClient, HTTPClientError
+from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_cache import load_json_cache, load_json_subset, save_json_cache
 from src_py_lib.utils.json_types import (
     JSONDict,
@@ -116,6 +120,7 @@ __all__ = [
     "GoogleSheetsError",
     "HTTPClient",
     "HTTPClientError",
+    "HTTPResponse",
     "JSONDict",
     "LinearClient",
     "LinearClientConfig",
@@ -128,6 +133,9 @@ __all__ = [
     "SlackPacer",
     "SourcegraphClient",
     "SourcegraphClientConfig",
+    "SourcegraphJaegerTraceError",
+    "SourcegraphJaegerTraceSummary",
+    "SourcegraphTrace",
     "aliased_batched_query",
     "config_field",
     "config_snapshot",
@@ -159,6 +167,7 @@ __all__ = [
     "quota_project_from_adc",
     "resolve_log_level_name",
     "save_json_cache",
+    "sampled_traceparent",
     "slack_client_from_config",
     "sourcegraph_client_from_config",
     "stage",
