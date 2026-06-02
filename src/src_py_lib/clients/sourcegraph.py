@@ -16,16 +16,13 @@ from urllib.parse import urlsplit
 from src_py_lib.clients.graphql import GraphQLClient, stream_connection_nodes
 from src_py_lib.utils.config import Config, config_field
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
-from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list
-from src_py_lib.utils.logging import (
-    current_trace_context,
-    new_trace_context,
-    submit_with_log_context,
-    trace_context_from_traceparent,
-    traceparent_header,
-)
+from src_py_lib.utils.json_types import (JSONDict, JSONValue, json_dict,
+                                         json_list)
+from src_py_lib.utils.logging import (current_trace_context, new_trace_context,
+                                      submit_with_log_context,
+                                      trace_context_from_traceparent,
+                                      traceparent_header)
 
-DEFAULT_SOURCEGRAPH_ENDPOINT = "https://sourcegraph.com"
 SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE: Final[str] = "ExternalService"
 SOURCEGRAPH_REPOSITORY_NODE_TYPE: Final[str] = "Repository"
 REQUEST_TRACE_HEADER: Final[str] = "X-Sourcegraph-Request-Trace"
@@ -158,11 +155,12 @@ class SourcegraphClientConfig(Config):
     """Config fields needed to build a Sourcegraph API client."""
 
     src_endpoint: str = config_field(
-        default=DEFAULT_SOURCEGRAPH_ENDPOINT,
+        default="",
         env_var="SRC_ENDPOINT",
         cli_flag="--src-endpoint",
         metavar="URL",
-        help=f"Sourcegraph instance URL (default: {DEFAULT_SOURCEGRAPH_ENDPOINT})",
+        help=f"Sourcegraph instance URL",
+        required=True,
     )
     src_access_token: str = config_field(
         default="",
