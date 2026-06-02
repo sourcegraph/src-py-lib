@@ -52,6 +52,8 @@ from src_py_lib.utils.config import (
     Config,
     ConfigError,
     config_field,
+    config_field_names,
+    config_help_formatter,
     config_snapshot,
 )
 from src_py_lib.utils.config import (
@@ -150,6 +152,8 @@ __all__ = [
     "TraceContext",
     "aliased_batched_query",
     "config_field",
+    "config_field_names",
+    "config_help_formatter",
     "config_snapshot",
     "configure_logging",
     "critical",

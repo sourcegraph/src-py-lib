@@ -27,6 +27,8 @@ class PackageImportTest(unittest.TestCase):
         self.assertIsNotNone(src_py_lib.SourcegraphClient)
         self.assertIsNotNone(src_py_lib.SourcegraphClientConfig)
         self.assertIsNotNone(src_py_lib.config_field)
+        self.assertIsNotNone(src_py_lib.config_field_names)
+        self.assertIsNotNone(src_py_lib.config_help_formatter)
         self.assertIsNotNone(src_py_lib.gh_cli_token)
         self.assertIsNotNone(src_py_lib.gcloud_adc_access_token)
         self.assertIsNotNone(src_py_lib.info)

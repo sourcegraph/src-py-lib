@@ -25,7 +25,6 @@ from src_py_lib.utils.logging import (
     traceparent_header,
 )
 
-DEFAULT_SOURCEGRAPH_ENDPOINT = "https://sourcegraph.com"
 SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE: Final[str] = "ExternalService"
 SOURCEGRAPH_REPOSITORY_NODE_TYPE: Final[str] = "Repository"
 REQUEST_TRACE_HEADER: Final[str] = "X-Sourcegraph-Request-Trace"
@@ -158,11 +157,13 @@ class SourcegraphClientConfig(Config):
     """Config fields needed to build a Sourcegraph API client."""
 
     src_endpoint: str = config_field(
-        default=DEFAULT_SOURCEGRAPH_ENDPOINT,
+        default="",
         env_var="SRC_ENDPOINT",
         cli_flag="--src-endpoint",
         metavar="URL",
-        help=f"Sourcegraph instance URL (default: {DEFAULT_SOURCEGRAPH_ENDPOINT})",
+        help="Sourcegraph instance URL",
+        help_group="Sourcegraph",
+        required=True,
     )
     src_access_token: str = config_field(
         default="",
@@ -170,6 +171,7 @@ class SourcegraphClientConfig(Config):
         cli_flag="--src-access-token",
         metavar="TOKEN",
         help="Sourcegraph access token, or op:// secret reference",
+        help_group="Sourcegraph",
         secret=True,
         required=True,
     )

@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import UnionType
-from typing import Any, Final, Literal, TypeVar, Union, cast, get_args, get_origin
+from typing import Any, Final, Literal, TypeAlias, TypeVar, Union, cast, get_args, get_origin
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -33,6 +33,7 @@ DEFAULT_CONFIG_ENV_FILE: Final[Path] = Path(".env")
 CONFIG_HELP_MIN_POSITION: Final[int] = 24
 CONFIG_HELP_MAX_POSITION_LIMIT: Final[int] = 48
 CONFIG_HELP_PADDING: Final[int] = 4
+DEFAULT_CONFIG_HELP_GROUP: Final[str] = "Config"
 _CONFIG_OPTION_KEY: Final[str] = "src_py_lib_config_option"
 _MISSING: Final[object] = object()
 
@@ -67,6 +68,7 @@ class ConfigOption:
     cli_const: object | None = None
     metavar: str | None = None
     help: str = ""
+    help_group: str = DEFAULT_CONFIG_HELP_GROUP
     secret: bool = False
     required: bool = False
 
@@ -78,6 +80,7 @@ class Config(BaseModel):
 
 
 ConfigType = TypeVar("ConfigType", bound=Config)
+ConfigFieldSource: TypeAlias = str | type[Config]
 
 
 def config_field(
@@ -91,6 +94,7 @@ def config_field(
     cli_const: object | None = None,
     metavar: str | None = None,
     help: str = "",
+    help_group: str = DEFAULT_CONFIG_HELP_GROUP,
     secret: bool = False,
     required: bool = False,
     gt: int | float | None = None,
@@ -110,6 +114,7 @@ def config_field(
         cli_const=cli_const,
         metavar=metavar,
         help=help,
+        help_group=help_group,
         secret=secret,
         required=required,
     )
@@ -138,6 +143,38 @@ def config_options(config_cls: type[Config]) -> tuple[ConfigOption, ...]:
         if option is not None:
             options.append(option)
     return tuple(options)
+
+
+def config_field_names(*sources: ConfigFieldSource) -> tuple[str, ...]:
+    """Return Config field names from Config classes and explicit field names.
+
+    Use this to define reusable CLI argument sets from Config mixins while
+    keeping the field metadata defined once on the Config classes.
+    """
+    names: list[str] = []
+    for source in sources:
+        if isinstance(source, str):
+            names.append(source)
+            continue
+        names.extend(option.field_name for option in config_options(source))
+    return tuple(dict.fromkeys(names))
+
+
+def config_help_formatter(
+    config_cls: type[Config],
+    *,
+    include_env_file: bool = True,
+    include_fields: Iterable[str] | None = None,
+    exclude_fields: Iterable[str] = (),
+) -> type[argparse.HelpFormatter]:
+    """Return a help formatter aligned for the selected Config fields."""
+    max_help_position = _config_help_max_position(
+        config_cls,
+        include_env_file=include_env_file,
+        include_fields=include_fields,
+        exclude_fields=exclude_fields,
+    )
+    return _config_help_formatter(max_help_position)
 
 
 def load_config_env_file(path: Path | None) -> dict[str, str]:
@@ -192,22 +229,19 @@ def add_config_arguments(
     config_cls: type[Config],
     *,
     include_env_file: bool = True,
+    include_fields: Iterable[str] | None = None,
+    exclude_fields: Iterable[str] = (),
 ) -> None:
     """Add Config CLI flags to an argparse parser."""
-    group = parser.add_argument_group(
-        "Config",
-        "These options override matching environment variables and .env values",
-    )
-    if include_env_file:
-        group.add_argument(
-            "--env-file",
-            dest="env_file",
-            default=None,
-            metavar="PATH",
-            help="Read Config .env values from PATH (default: .env)",
-        )
+    groups: dict[str, Any] = {}
 
-    for option in config_options(config_cls):
+    def argument_group(title: str) -> Any:
+        if title not in groups:
+            groups[title] = parser.add_argument_group(title)
+        return groups[title]
+
+    for option in _selected_config_options(config_cls, include_fields, exclude_fields):
+        group = argument_group(option.help_group or DEFAULT_CONFIG_HELP_GROUP)
         field_info = config_cls.model_fields[option.field_name]
         argument_kwargs: dict[str, Any] = {
             "dest": option.field_name,
@@ -227,6 +261,15 @@ def add_config_arguments(
                 argument_kwargs["action"] = option.cli_action
         group.add_argument(option.cli_flag, *option.cli_aliases, **argument_kwargs)
 
+    if include_env_file:
+        argument_group(DEFAULT_CONFIG_HELP_GROUP).add_argument(
+            "--env-file",
+            dest="env_file",
+            default=None,
+            metavar="PATH",
+            help="Read Config .env values from PATH (default: .env)",
+        )
+
 
 def config_parse_args(
     config_cls: type[ConfigType],
@@ -235,6 +278,8 @@ def config_parse_args(
     argv: Sequence[str] | None = None,
     description: str | None = None,
     include_env_file: bool = True,
+    include_fields: Iterable[str] | None = None,
+    exclude_fields: Iterable[str] = (),
     env: Mapping[str, str] | None = None,
     base_dir: Path | None = None,
     resolve_op_refs: bool = True,
@@ -242,12 +287,23 @@ def config_parse_args(
     require: Iterable[str] = (),
 ) -> ConfigType:
     """Parse Config CLI flags and return a validated Config model."""
-    max_help_position = _config_help_max_position(config_cls, include_env_file=include_env_file)
+    formatter_class = config_help_formatter(
+        config_cls,
+        include_env_file=include_env_file,
+        include_fields=include_fields,
+        exclude_fields=exclude_fields,
+    )
     argument_parser = parser or argparse.ArgumentParser(
         description=description,
-        formatter_class=_config_help_formatter(max_help_position),
+        formatter_class=formatter_class,
     )
-    add_config_arguments(argument_parser, config_cls, include_env_file=include_env_file)
+    add_config_arguments(
+        argument_parser,
+        config_cls,
+        include_env_file=include_env_file,
+        include_fields=include_fields,
+        exclude_fields=exclude_fields,
+    )
     args = argument_parser.parse_args(argv)
     try:
         return load_config_from_args(
@@ -277,18 +333,62 @@ def _config_help_max_position(
     config_cls: type[Config],
     *,
     include_env_file: bool,
+    include_fields: Iterable[str] | None = None,
+    exclude_fields: Iterable[str] = (),
 ) -> int:
     """Return help-column width based on this Config's CLI arguments."""
     invocation_lengths = [len("--env-file PATH")] if include_env_file else []
     invocation_lengths.extend(
         _config_option_invocation_length(config_cls, option)
-        for option in config_options(config_cls)
+        for option in _selected_config_options(config_cls, include_fields, exclude_fields)
     )
     longest_invocation = max(invocation_lengths, default=0)
     return min(
         max(CONFIG_HELP_MIN_POSITION, longest_invocation + CONFIG_HELP_PADDING),
         CONFIG_HELP_MAX_POSITION_LIMIT,
     )
+
+
+def _selected_config_options(
+    config_cls: type[Config],
+    include_fields: Iterable[str] | None,
+    exclude_fields: Iterable[str],
+) -> tuple[ConfigOption, ...]:
+    """Return options selected by field or env-var names.
+
+    When include_fields is set, its order controls the returned option order.
+    Without include_fields, Config model field order is preserved.
+    """
+    options = config_options(config_cls)
+    excluded = _selected_config_field_names(options, exclude_fields) or set()
+    if include_fields is None:
+        return tuple(option for option in options if not _option_is_selected(option, excluded))
+
+    options_by_field_name = {option.field_name: option for option in options}
+    return tuple(
+        options_by_field_name[field_name]
+        for field_name in _selected_config_field_names_in_order(options, include_fields)
+        if field_name not in excluded
+    )
+
+
+def _selected_config_field_names_in_order(
+    options: tuple[ConfigOption, ...],
+    selected: Iterable[str],
+) -> tuple[str, ...]:
+    """Return selected field names in caller order after validating names."""
+    names = (_option_by_name(options, name).field_name for name in selected)
+    return tuple(dict.fromkeys(names))
+
+
+def _selected_config_field_names(
+    options: tuple[ConfigOption, ...],
+    selected: Iterable[str] | None,
+) -> set[str] | None:
+    """Return selected field names after validating field or env-var names."""
+    if selected is None:
+        return None
+    return {_option_by_name(options, name).field_name for name in selected}
 
 
 def _config_option_invocation_length(config_cls: type[Config], option: ConfigOption) -> int:
@@ -452,6 +552,7 @@ def _config_option_payload(option: ConfigOption) -> dict[str, object]:
         "cli_const": option.cli_const,
         "metavar": option.metavar,
         "help": option.help,
+        "help_group": option.help_group,
         "secret": option.secret,
         "required": option.required,
     }
@@ -467,6 +568,7 @@ def _config_option_from_payload(payload: Mapping[str, object]) -> ConfigOption |
     cli_nargs = payload.get("cli_nargs")
     metavar = payload.get("metavar")
     help_text = payload.get("help")
+    help_group = payload.get("help_group")
     return ConfigOption(
         field_name="",
         env_var=env_var,
@@ -477,6 +579,7 @@ def _config_option_from_payload(payload: Mapping[str, object]) -> ConfigOption |
         cli_const=payload.get("cli_const"),
         metavar=metavar if isinstance(metavar, str) else None,
         help=help_text if isinstance(help_text, str) else "",
+        help_group=help_group if isinstance(help_group, str) else DEFAULT_CONFIG_HELP_GROUP,
         secret=payload.get("secret") is True,
         required=payload.get("required") is True,
     )
