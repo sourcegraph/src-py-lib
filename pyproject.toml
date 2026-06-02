@@ -10,7 +10,7 @@ dev = [
 
 [project]
 name = "src-py-lib"
-version = "0.1.6"
+version = "0.1.7"
 description = "Reusable libraries for Sourcegraph projects"
 readme = "README.md"
 requires-python = ">=3.11"
