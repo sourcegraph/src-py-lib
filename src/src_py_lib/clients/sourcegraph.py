@@ -16,12 +16,14 @@ from urllib.parse import urlsplit
 from src_py_lib.clients.graphql import GraphQLClient, stream_connection_nodes
 from src_py_lib.utils.config import Config, config_field
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
-from src_py_lib.utils.json_types import (JSONDict, JSONValue, json_dict,
-                                         json_list)
-from src_py_lib.utils.logging import (current_trace_context, new_trace_context,
-                                      submit_with_log_context,
-                                      trace_context_from_traceparent,
-                                      traceparent_header)
+from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list
+from src_py_lib.utils.logging import (
+    current_trace_context,
+    new_trace_context,
+    submit_with_log_context,
+    trace_context_from_traceparent,
+    traceparent_header,
+)
 
 SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE: Final[str] = "ExternalService"
 SOURCEGRAPH_REPOSITORY_NODE_TYPE: Final[str] = "Repository"
@@ -159,7 +161,8 @@ class SourcegraphClientConfig(Config):
         env_var="SRC_ENDPOINT",
         cli_flag="--src-endpoint",
         metavar="URL",
-        help=f"Sourcegraph instance URL",
+        help="Sourcegraph instance URL",
+        help_group="Sourcegraph",
         required=True,
     )
     src_access_token: str = config_field(
@@ -168,6 +171,7 @@ class SourcegraphClientConfig(Config):
         cli_flag="--src-access-token",
         metavar="TOKEN",
         help="Sourcegraph access token, or op:// secret reference",
+        help_group="Sourcegraph",
         secret=True,
         required=True,
     )

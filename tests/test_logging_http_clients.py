@@ -50,6 +50,7 @@ from src_py_lib.utils.config import (
     add_config_arguments,
     config_env_file_from_args,
     config_field,
+    config_field_names,
     config_overrides_from_args,
     config_parse_args,
     config_snapshot,
@@ -198,6 +199,32 @@ class MultilineHelpConfig(Config):
     )
 
 
+class GroupedHelpConfig(Config):
+    """Config model with grouped help sections."""
+
+    alpha: str = config_field(
+        default="",
+        env_var="GROUPED_HELP_ALPHA",
+        cli_flag="--alpha",
+        help="Alpha option",
+        help_group="First group",
+    )
+    beta: str = config_field(
+        default="",
+        env_var="GROUPED_HELP_BETA",
+        cli_flag="--beta",
+        help="Beta option",
+        help_group="Second group",
+    )
+    gamma: str = config_field(
+        default="",
+        env_var="GROUPED_HELP_GAMMA",
+        cli_flag="--gamma",
+        help="Gamma option",
+        help_group="First group",
+    )
+
+
 class SnapshotOrderConfig(Config):
     """Config model whose field names and env-var names sort differently."""
 
@@ -340,6 +367,8 @@ class ConfigTest(unittest.TestCase):
         add_config_arguments(parser, SourcegraphExampleConfig)
         args = parser.parse_args(
             [
+                "--src-endpoint",
+                "https://sourcegraph.example.com",
                 "--src-access-token",
                 "test-token",
                 "--repo-query",
@@ -355,10 +384,10 @@ class ConfigTest(unittest.TestCase):
         )
         client = sourcegraph_client_from_config(config)
 
-        self.assertEqual(config.src_endpoint, "https://sourcegraph.com")
+        self.assertEqual(config.src_endpoint, "https://sourcegraph.example.com")
         self.assertEqual(config.src_access_token, "test-token")
         self.assertEqual(config.repo_query, "repo:example")
-        self.assertEqual(client.endpoint, "https://sourcegraph.com")
+        self.assertEqual(client.endpoint, "https://sourcegraph.example.com")
         self.assertEqual(client.token, "test-token")
 
     def test_load_config_uses_precedence_and_pydantic_types(self) -> None:
@@ -455,6 +484,82 @@ class ConfigTest(unittest.TestCase):
                 "labels": "one,two",
             },
         )
+
+    def test_config_field_names_combines_config_classes_and_fields(self) -> None:
+        self.assertEqual(
+            config_field_names(SourcegraphClientConfig, LoggingConfig, "page_size"),
+            (
+                "src_endpoint",
+                "src_access_token",
+                "src_log_level",
+                "verbose",
+                "quiet",
+                "silent",
+                "page_size",
+            ),
+        )
+
+    def test_add_config_arguments_can_select_reusable_field_sets(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_config_arguments(
+            parser,
+            ExampleConfig,
+            include_fields=("token", "page_size", "EXAMPLE_LABELS"),
+            exclude_fields=("page_size",),
+        )
+
+        args = parser.parse_args(["--token", "raw-token", "--labels", "one,two"])
+
+        self.assertEqual(
+            config_overrides_from_args(ExampleConfig, args),
+            {
+                "token": "raw-token",
+                "labels": "one,two",
+            },
+        )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--page-size", "50"])
+
+    def test_config_parse_args_help_only_shows_selected_fields(self) -> None:
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            config_parse_args(
+                ExampleConfig,
+                argv=["--help"],
+                env={},
+                resolve_op_refs=False,
+                include_fields=("labels", "token"),
+            )
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = stdout.getvalue()
+        self.assertIn("--token TOKEN", help_text)
+        self.assertIn("--labels CSV", help_text)
+        self.assertLess(help_text.index("--labels CSV"), help_text.index("--token TOKEN"))
+        self.assertNotIn("--page-size", help_text)
+        self.assertNotIn("--include-archived", help_text)
+
+    def test_config_parse_args_groups_help_by_field_metadata(self) -> None:
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            config_parse_args(
+                GroupedHelpConfig,
+                argv=["--help"],
+                env={},
+                resolve_op_refs=False,
+                include_fields=("beta", "alpha", "gamma"),
+            )
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = stdout.getvalue()
+        self.assertLess(help_text.index("Second group:"), help_text.index("First group:"))
+        self.assertLess(help_text.index("First group:"), help_text.index("Config:"))
+        self.assertLess(help_text.index("--alpha"), help_text.index("--gamma"))
+        self.assertIn("Second group:\n  --beta", help_text)
+        self.assertIn("First group:\n  --alpha", help_text)
+        self.assertNotIn("override matching environment variables", help_text)
 
     def test_config_arguments_support_aliases_actions_and_optional_values(self) -> None:
         parser = argparse.ArgumentParser()

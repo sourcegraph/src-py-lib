@@ -100,6 +100,7 @@ class LoggingConfig(Config):
         cli_flag="--src-log-level",
         metavar="LEVEL",
         help="Log level (default: INFO)",
+        help_group="Logging",
     )
     verbose: bool = config_field(
         default=False,
@@ -108,6 +109,7 @@ class LoggingConfig(Config):
         cli_aliases=("-v",),
         cli_action="store_true",
         help="Alias for --src-log-level DEBUG",
+        help_group="Logging",
     )
     quiet: bool = config_field(
         default=False,
@@ -116,6 +118,7 @@ class LoggingConfig(Config):
         cli_aliases=("-q",),
         cli_action="store_true",
         help="Alias for --src-log-level WARNING",
+        help_group="Logging",
     )
     silent: bool = config_field(
         default=False,
@@ -124,6 +127,7 @@ class LoggingConfig(Config):
         cli_aliases=("-s",),
         cli_action="store_true",
         help="Alias for --src-log-level ERROR",
+        help_group="Logging",
     )
 
     @model_validator(mode="after")
