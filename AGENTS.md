@@ -59,8 +59,7 @@ uv run python -m unittest discover -s tests
 - The release workflow builds from the tag and checks that wheel and source
   distribution filenames match the tag version before publishing.
 - Do not make the release workflow edit `pyproject.toml` or `uv.lock`.
-- Prefer the release script described in `dev/release-automation.md` once it
-  exists. Until then, tag the remote head of `main` directly:
+- Tag the remote head of `main` directly:
 
 ```sh
 set -euo pipefail
