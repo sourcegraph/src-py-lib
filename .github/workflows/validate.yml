@@ -158,6 +158,7 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
 
@@ -217,6 +218,7 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
 
