@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
@@ -10,7 +10,7 @@ dev = [
 
 [project]
 name = "src-py-lib"
-version = "0.1.7"
+dynamic = ["version"]
 description = "Reusable libraries for Sourcegraph projects"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,6 +43,9 @@ Issues = "https://github.com/sourcegraph/src-py-lib/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/src_py_lib"]
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.pyright]
 include = ["src/src_py_lib", "tests"]

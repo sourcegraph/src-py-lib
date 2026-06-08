@@ -51,111 +51,28 @@ uv run python -m unittest discover -s tests
 
 ## Release process
 
-- The tagged source commit must already contain the package version it
-  releases. Do not make the release workflow edit `pyproject.toml`.
-- The tag must be `vMAJOR.MINOR.PATCH`, and `.github/workflows/release.yml`
-  verifies that it matches `project.version` before building GitHub release
-  assets and publishing to PyPI.
-- Prepare releases on a branch from current `main`. Set `VERSION`, then run:
-- As part of every release bump, find old release-version literals in
-  `AGENTS.md`, `README.md`, and release snippets, and replace them with the
-  new version where they are meant to stay current.
+- Package versions are derived from Git tags through `hatch-vcs`.
+- `pyproject.toml` must use `dynamic = ["version"]`; do not add a hard-coded
+  `project.version` for releases.
+- The release tag must be `vMAJOR.MINOR.PATCH` and point at a commit reachable
+  from `origin/main`.
+- The release workflow builds from the tag and checks that wheel and source
+  distribution filenames match the tag version before publishing.
+- Do not make the release workflow edit `pyproject.toml` or `uv.lock`.
+- Tag the remote head of `main` directly:
 
 ```sh
 set -euo pipefail
 
-VERSION=0.1.6
-BRANCH="release-v${VERSION}"
-
-git fetch origin --tags --prune
-git switch main
-git pull --ff-only
-git switch -c "${BRANCH}"
-
-uv run python - "${VERSION}" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-version = sys.argv[1]
-path = Path("pyproject.toml")
-text = path.read_text()
-new_text = re.sub(
-    r'(?m)^version = "[^"]+"$',
-    f'version = "{version}"',
-    text,
-    count=1,
-)
-if new_text == text:
-    raise SystemExit("pyproject.toml version was not updated")
-path.write_text(new_text)
-PY
-
-uv lock
-```
-
-- Validate before opening the PR:
-
-```sh
-set -euo pipefail
-
-uv lock --check
-actionlint
-npx --yes markdownlint-cli2@0.22.1
-uv run ruff check .
-uv run ruff format --check .
-uv run pyright
-uv run python -m unittest discover -s tests
-uv build --wheel --sdist --out-dir /tmp/src-py-lib-release-check --no-create-gitignore
-rm -rf /tmp/src-py-lib-release-check
-```
-
-- Commit, push, open the PR, wait for checks, then merge it. If review is
-  required, stop after `gh pr checks` and ask for review before merging.
-
-```sh
-set -euo pipefail
-
-VERSION=0.1.6
-BRANCH="release-v${VERSION}"
+VERSION_INPUT=<next-version>
+VERSION="${VERSION_INPUT#v}"
 GH_REPO="sourcegraph/src-py-lib"
 
-git add pyproject.toml uv.lock
-git commit -m "Release v${VERSION}"
-git push -u origin "${BRANCH}"
-
-gh pr create \
-  --repo "${GH_REPO}" \
-  --base main \
-  --head "${BRANCH}" \
-  --title "Release v${VERSION}" \
-  --body "Bump src-py-lib package metadata to ${VERSION}."
-
-gh pr checks "${BRANCH}" --repo "${GH_REPO}" --watch --fail-fast
-gh pr merge "${BRANCH}" --repo "${GH_REPO}" --squash --delete-branch
-```
-
-- Tag the merged `main` commit. Do not tag a branch commit.
-
-```sh
-set -euo pipefail
-
-VERSION=0.1.6
-
+[[ "${VERSION_INPUT}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
 git fetch origin --tags --prune
-git switch main
-git pull --ff-only
-git tag "v${VERSION}"
+MAIN_COMMIT="$(git rev-parse origin/main)"
+git tag -a "v${VERSION}" "${MAIN_COMMIT}" -m "Release v${VERSION}"
 git push origin "v${VERSION}"
-```
-
-- Watch the release workflow and confirm the GitHub release and PyPI project.
-
-```sh
-set -euo pipefail
-
-VERSION=0.1.6
-GH_REPO="sourcegraph/src-py-lib"
 
 RUN_ID="$(
   gh run list \
