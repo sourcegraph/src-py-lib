@@ -9,6 +9,15 @@
         "python"
       ],
       "allowedVersions": "<3.12"
+    },
+    {
+      "matchPackageNames": [
+        "python"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "enabled": false
     }
   ],
   "schedule": [
