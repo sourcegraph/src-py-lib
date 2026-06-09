@@ -491,9 +491,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1,<1" },
-    { name = "opentelemetry-api", specifier = ">=1.38.0,<2" },
-    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.38.0,<2" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.38.0,<2" },
+    { name = "opentelemetry-api", specifier = ">=1.42.1,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.42.1,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.42.1,<2" },
     { name = "pydantic", specifier = ">=2.13.4,<3" },
     { name = "python-dotenv", specifier = ">=1.2.2,<2" },
 ]
@@ -501,8 +501,8 @@ provides-extras = ["otel"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38.0,<2" },
-    { name = "opentelemetry-sdk", specifier = ">=1.38.0,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.42.1,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.42.1,<2" },
     { name = "pyright", specifier = ">=1.1.410" },
     { name = "ruff", specifier = ">=0.15.16" },
 ]
