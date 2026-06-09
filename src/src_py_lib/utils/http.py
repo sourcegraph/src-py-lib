@@ -14,7 +14,7 @@ from typing import Final, cast
 import httpx
 
 from src_py_lib.utils.json_types import JSONDict, json_dict
-from src_py_lib.utils.logging import event, record_http_attempt, record_http_retry
+from src_py_lib.utils.logging import record_http_attempt, record_http_retry, span
 from src_py_lib.utils.telemetry import (
     inject_current_trace_context,
     mark_current_span_error,
@@ -166,7 +166,7 @@ class HTTPClient:
         for attempt in range(1, self.max_attempts + 1):
             attempt_started = time.perf_counter()
             try:
-                with event(
+                with span(
                     "http_request",
                     level="debug",
                     method=method,

@@ -2,7 +2,7 @@
 
 Use `configure_logging()` once near process startup. Other modules should use
 `logging.getLogger(__name__)` for human-readable operator messages and
-`event()` / `log()` for structured JSONL events.
+`span()` / `log_event()` for structured JSONL events.
 """
 
 from __future__ import annotations
@@ -250,7 +250,7 @@ class ResourceSampler:
 
     def emit_sample(self) -> None:
         """Emit one DEBUG `resource_sample` event."""
-        log("debug", "resource_sample", **self._sample_fields())
+        log_event("debug", "resource_sample", **self._sample_fields())
 
     def stop_and_summary(self) -> dict[str, Any]:
         """Stop periodic sampling and return run-end resource fields."""
@@ -534,7 +534,7 @@ def logging_context(
                 telemetry.set_current_span_attributes(end_fields)
                 if error_type:
                     telemetry.mark_current_span_error(error_type)
-                log(
+                log_event(
                     "error" if error_type else "info",
                     "run",
                     logger_name=resolved_logging_config.logger_name,
@@ -551,13 +551,13 @@ def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Pa
     return logs_dir / f"{timestamp}-{run}.json"
 
 
-def log(level: str, key: str, *, logger_name: str = "", **fields: Any) -> None:
+def log_event(level: str, key: str, *, logger_name: str = "", **fields: Any) -> None:
     """Log one structured event through the configured logger."""
     numeric_level = _log_level(level)
     logger = logging.getLogger(logger_name)
     if not logger.isEnabledFor(numeric_level):
         return
-    telemetry.add_current_span_event(key, {"level": logging.getLevelName(numeric_level), **fields})
+    telemetry.add_span_event(key, {"level": logging.getLevelName(numeric_level), **fields})
     logger.log(
         numeric_level,
         "event=%s",
@@ -571,32 +571,32 @@ def log(level: str, key: str, *, logger_name: str = "", **fields: Any) -> None:
 
 def debug(key: str, *, logger_name: str = "", **fields: Any) -> None:
     """Log a DEBUG structured event."""
-    log("debug", key, logger_name=logger_name, **fields)
+    log_event("debug", key, logger_name=logger_name, **fields)
 
 
 def info(key: str, *, logger_name: str = "", **fields: Any) -> None:
     """Log an INFO structured event."""
-    log("info", key, logger_name=logger_name, **fields)
+    log_event("info", key, logger_name=logger_name, **fields)
 
 
 def warning(key: str, *, logger_name: str = "", **fields: Any) -> None:
     """Log a WARNING structured event."""
-    log("warning", key, logger_name=logger_name, **fields)
+    log_event("warning", key, logger_name=logger_name, **fields)
 
 
 def error(key: str, *, logger_name: str = "", **fields: Any) -> None:
     """Log an ERROR structured event."""
-    log("error", key, logger_name=logger_name, **fields)
+    log_event("error", key, logger_name=logger_name, **fields)
 
 
 def critical(key: str, *, logger_name: str = "", **fields: Any) -> None:
     """Log a CRITICAL structured event."""
-    log("critical", key, logger_name=logger_name, **fields)
+    log_event("critical", key, logger_name=logger_name, **fields)
 
 
 @contextlib.contextmanager
 def log_context(**fields: Any) -> Generator[None]:
-    """Add inherited structured fields for nested `log()` calls."""
+    """Add inherited structured fields for nested `log_event()` calls."""
     reset_token = _CONTEXT.set({**_CONTEXT.get({}), **fields})
     try:
         yield
@@ -612,7 +612,7 @@ def stage(name: str, **fields: Any) -> Generator[None]:
 
 
 @contextlib.contextmanager
-def event(
+def span(
     key: str,
     *,
     level: str = "info",
@@ -621,12 +621,12 @@ def event(
     logger_name: str = "",
     **fields: Any,
 ) -> Generator[dict[str, Any]]:
-    """Emit start/end structured events around a block of work."""
+    """Open an observed span and emit start/end structured log events."""
     parent_span_id = telemetry.current_span_id()
     parent_reset_token = _PARENT_SPAN_CONTEXT.set(parent_span_id)
     try:
         with telemetry.open_telemetry_span(key, fields):
-            log(start_level or level, key, logger_name=logger_name, phase="start", **fields)
+            log_event(start_level or level, key, logger_name=logger_name, phase="start", **fields)
             started = time.perf_counter()
             extra: dict[str, Any] = {}
             error: BaseException | None = None
@@ -650,7 +650,7 @@ def event(
                     end_fields["status"] = "ok"
                     end_fields["error_type"] = None
                 telemetry.set_current_span_attributes(end_fields)
-                log(
+                log_event(
                     "error" if error else level,
                     key,
                     logger_name=logger_name,

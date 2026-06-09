@@ -245,8 +245,8 @@ def set_current_span_attributes(fields: Mapping[str, object]) -> None:
         span.set_attribute(key, value)
 
 
-def add_current_span_event(name: str, fields: Mapping[str, object]) -> None:
-    """Add a log event to the active span when recording is enabled."""
+def add_span_event(name: str, fields: Mapping[str, object]) -> None:
+    """Add an event to the active span when recording is enabled."""
     span = trace.get_current_span()
     if span.is_recording():
         span.add_event(name, attributes=span_attributes(fields))

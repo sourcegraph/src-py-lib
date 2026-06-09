@@ -69,12 +69,12 @@ from src_py_lib.utils.logging import (
     debug,
     default_log_file,
     error,
-    event,
     info,
-    log,
     log_context,
+    log_event,
     logging_settings_from_config,
     resolve_log_level_name,
+    span,
     startup_event,
     warning,
 )
@@ -930,7 +930,7 @@ class LoggingTest(unittest.TestCase):
                 )
             )
             try:
-                log("bogus", "fallback_info", logger_name=logger_name)
+                log_event("bogus", "fallback_info", logger_name=logger_name)
                 warning("warning_event", logger_name=logger_name)
                 error("error_event", logger_name=logger_name)
                 critical("critical_event", logger_name=logger_name)
@@ -1040,7 +1040,7 @@ class LoggingTest(unittest.TestCase):
             self.assertEqual(rows[-1]["command"], "unit-test")
             self.assertEqual(rows[-1]["answer"], 42)
 
-    def test_event_context_adds_trace_and_span_fields(self) -> None:
+    def test_span_context_adds_trace_and_span_fields(self) -> None:
         src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
@@ -1054,9 +1054,9 @@ class LoggingTest(unittest.TestCase):
                 )
             )
             try:
-                with event("outer", logger_name=logger_name):
+                with span("outer", logger_name=logger_name):
                     info("inside", logger_name=logger_name, answer=42)
-                    with event("inner", logger_name=logger_name):
+                    with span("inner", logger_name=logger_name):
                         logging.getLogger(logger_name).info("inside nested span")
             finally:
                 logger = logging.getLogger(logger_name)
@@ -1133,7 +1133,7 @@ class LoggingTest(unittest.TestCase):
     def test_otel_helpers_return_current_w3c_traceparent_fields(self) -> None:
         src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
 
-        with event("traceparent_test"):
+        with span("traceparent_test"):
             traceparent = src.current_traceparent_header()
             self.assertIsNotNone(traceparent)
             assert traceparent is not None
@@ -1145,7 +1145,7 @@ class LoggingTest(unittest.TestCase):
                 {"trace_id": traceparent_parts[1], "span_id": traceparent_parts[2]},
             )
 
-    def test_event_can_lower_start_level_and_omit_success_status(self) -> None:
+    def test_span_can_lower_start_level_and_omit_success_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
             logger_name = "src_py_lib_test_quiet_event"
@@ -1159,7 +1159,7 @@ class LoggingTest(unittest.TestCase):
                 )
             )
             try:
-                with event(
+                with span(
                     "quiet_start",
                     logger_name=logger_name,
                     level="info",
@@ -1669,7 +1669,7 @@ query Users($first: Int!, $after: String) {
             fetch_sg_traces=True,
         )
 
-        with event("sourcegraph_test"):
+        with span("sourcegraph_test"):
             self.assertEqual(
                 client.graphql("query Viewer { currentUser { username } }", follow_pages=False),
                 {"currentUser": {"username": "alice"}},
