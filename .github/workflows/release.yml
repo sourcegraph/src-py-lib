@@ -106,14 +106,33 @@ jobs:
           tag_revision="$(git rev-list -n 1 "${release_tag}")"
           git fetch --no-tags origin main
           main_revision="$(git rev-parse origin/main)"
-          if [[ "${tag_revision}" != "${main_revision}" ]]; then
-            echo "::error title=Tag is not origin/main::Tag '${release_tag}' points at ${tag_revision}, but origin/main is ${main_revision}."
-            echo "::error::Tag the remote head of main, then rerun the release."
+          if ! git merge-base --is-ancestor "${tag_revision}" "${main_revision}"; then
+            echo "::error title=Tag is not on main::Tag '${release_tag}' points at ${tag_revision}, which is not reachable from origin/main."
+            echo "::error::Tag a commit from main, then rerun the release."
             exit 1
           fi
 
           echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${release_tag#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate runtime dependencies
+        run: |
+          runtime_requirements_file="build/release/runtime-requirements.txt"
+          mkdir -p "$(dirname "${runtime_requirements_file}")"
+          uv export \
+            --no-dev \
+            --no-emit-project \
+            --no-hashes \
+            --no-header \
+            --no-annotate \
+            --frozen \
+            --output-file "${runtime_requirements_file}"
+
+          if grep -Eq '(^-e[[:space:]]|^(\.\.?/)|(^|[[:space:]])file:| @ (\.\.?/|file:))' "${runtime_requirements_file}"; then
+            echo "::error title=Unexpected local dependency::Runtime requirements must resolve from PyPI."
+            cat "${runtime_requirements_file}"
+            exit 1
+          fi
 
       - name: Build distributions
         id: build
@@ -174,11 +193,16 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Smoke test installed wheel
+        env:
+          WHEEL_PATH: ${{ steps.build.outputs.wheel_path }}
         run: |
-          python -m venv build/release/install-venv
-          . build/release/install-venv/bin/activate
-          python -m pip install "${{ steps.build.outputs.wheel_path }}"
-          python - <<'PY'
+          validation_dir="$(mktemp -d)"
+          python -m venv "${validation_dir}/venv"
+          . "${validation_dir}/venv/bin/activate"
+          python -m pip install "${GITHUB_WORKSPACE}/${WHEEL_PATH}"
+          (
+            cd "${validation_dir}"
+            python - <<'PY'
           import os
 
           import src_py_lib
@@ -186,6 +210,7 @@ jobs:
           if src_py_lib.__name__ != os.environ["IMPORT_NAME"]:
               raise SystemExit(f"unexpected import name: {src_py_lib.__name__}")
           PY
+          )
 
       - name: Write release notes
         id: notes
