@@ -10,19 +10,18 @@ import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Final, cast
+from typing import Final
 from urllib.parse import urlsplit
 
 from src_py_lib.clients.graphql import GraphQLClient, stream_connection_nodes
 from src_py_lib.utils.config import Config, config_field
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list
-from src_py_lib.utils.logging import (
-    current_trace_context,
-    new_trace_context,
-    submit_with_log_context,
-    trace_context_from_traceparent,
-    traceparent_header,
+from src_py_lib.utils.logging import submit_with_log_context
+from src_py_lib.utils.telemetry import (
+    current_traceparent_header,
+    set_current_span_attributes,
+    traceparent_fields,
 )
 
 SOURCEGRAPH_EXTERNAL_SERVICE_NODE_TYPE: Final[str] = "ExternalService"
@@ -187,16 +186,16 @@ class SourcegraphClient:
     Plain HTTP endpoints are rejected unless `allow_insecure_http=True` is set
     for local development.
 
-    Set `trace=True` to ask Sourcegraph to retain traces for each GraphQL
-    request. Traced requests are available through `drain_traces()` and can be
-    fetched from the instance's Jaeger/debug endpoint with
+    Set `fetch_sg_traces=True` to ask Sourcegraph to retain traces for each
+    GraphQL request. Traced requests are available through `drain_traces()` and
+    can be fetched from the instance's Jaeger/debug endpoint with
     `stream_jaeger_trace_summaries()`.
     """
 
     endpoint: str
     token: str
     http: HTTPClient = field(default_factory=HTTPClient)
-    trace: bool = False
+    fetch_sg_traces: bool = False
     allow_insecure_http: bool = False
     _traces: queue.Queue[SourcegraphTrace] = field(
         default_factory=lambda: queue.Queue[SourcegraphTrace](), init=False, repr=False
@@ -355,7 +354,7 @@ class SourcegraphClient:
             headers=self._graphql_headers,
             label="Sourcegraph",
             http=self.http,
-            response_hook=self._record_trace_response if self.trace else None,
+            response_hook=self._record_trace_response if self.fetch_sg_traces else None,
         )
 
     def _authorization_headers(self) -> dict[str, str]:
@@ -363,11 +362,11 @@ class SourcegraphClient:
 
     def _graphql_headers(self) -> dict[str, str]:
         headers = self._authorization_headers()
-        if self.trace:
+        if self.fetch_sg_traces:
             headers[REQUEST_TRACE_HEADER] = "true"
-            headers[TRACEPARENT_HEADER] = traceparent_header(
-                current_trace_context() or new_trace_context()
-            )
+            traceparent = current_traceparent_header()
+            if traceparent is not None:
+                headers[TRACEPARENT_HEADER] = traceparent
         return headers
 
     def _record_trace_response(
@@ -375,6 +374,13 @@ class SourcegraphClient:
     ) -> None:
         trace = sourcegraph_trace_from_headers(response.headers, request_headers)
         if trace is not None:
+            set_current_span_attributes(
+                {
+                    "sourcegraph.trace_id": trace.trace_id,
+                    "sourcegraph.trace_url": trace.trace_url,
+                    "sourcegraph.span_id": trace.span_id,
+                }
+            )
             self._traces.put(trace)
 
 
@@ -382,20 +388,15 @@ def sourcegraph_client_from_config(
     config: SourcegraphClientConfig,
     *,
     http: HTTPClient | None = None,
-    trace: bool = False,
+    fetch_sg_traces: bool = False,
 ) -> SourcegraphClient:
     """Return a Sourcegraph API client from shared Sourcegraph Config fields."""
     return SourcegraphClient(
         endpoint=config.src_endpoint,
         token=config.src_access_token,
         http=http or HTTPClient(),
-        trace=trace,
+        fetch_sg_traces=fetch_sg_traces,
     )
-
-
-def sampled_traceparent() -> str:
-    """Compatibility wrapper for sampled W3C traceparent generation."""
-    return traceparent_header(sampled=True)
 
 
 def sourcegraph_trace_from_headers(
@@ -407,13 +408,13 @@ def sourcegraph_trace_from_headers(
         return None
     span_id = header_value(response_headers, TRACE_SPAN_RESPONSE_HEADER)
     trace_url = header_value(response_headers, TRACE_URL_RESPONSE_HEADER)
-    parent = trace_context_from_traceparent(header_value(request_headers, TRACEPARENT_HEADER))
+    parent = traceparent_fields(header_value(request_headers, TRACEPARENT_HEADER))
     return SourcegraphTrace(
         trace_id=trace_id.lower(),
         span_id=span_id.lower() if span_id and is_hex_identifier(span_id, 16) else span_id,
         trace_url=trace_url,
-        parent_trace_id=parent.trace_id if parent is not None else None,
-        parent_span_id=parent.span_id if parent is not None else None,
+        parent_trace_id=parent.get("trace_id"),
+        parent_span_id=parent.get("span_id"),
     )
 
 
@@ -472,7 +473,7 @@ def summarize_jaeger_trace(
                 }
             )
 
-    hot_operations = [
+    hot_operations: list[JSONDict] = [
         {
             "operation": operation,
             "count": len(durations),
@@ -481,18 +482,23 @@ def summarize_jaeger_trace(
         }
         for operation, durations in durations_by_operation.items()
     ]
-    hot_operations.sort(key=lambda operation: float(operation["sum_ms"]), reverse=True)
+    hot_operations.sort(key=jaeger_summary_operation_sum_ms, reverse=True)
     return SourcegraphJaegerTraceSummary(
         trace=trace_metadata,
         jaeger_found=True,
         span_count=len(spans),
-        hot_operations=tuple(cast(JSONDict, operation) for operation in hot_operations[:10]),
+        hot_operations=tuple(hot_operations[:10]),
         graphql_operations=tuple(
             {"operation": operation, "count": count}
             for operation, count in graphql_operations.most_common(10)
         ),
         errored_spans=tuple(errored_spans[:5]),
     )
+
+
+def jaeger_summary_operation_sum_ms(operation: JSONDict) -> float:
+    """Return the total duration for sorting compact Jaeger operation summaries."""
+    return float_value(operation.get("sum_ms"))
 
 
 def jaeger_span_tags(span: JSONDict) -> dict[str, object]:

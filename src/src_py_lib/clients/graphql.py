@@ -11,7 +11,7 @@ from typing import cast
 
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse, log_safe_url
 from src_py_lib.utils.json_types import JSONDict, JSONValue, json_dict, json_list, json_str
-from src_py_lib.utils.logging import event
+from src_py_lib.utils.logging import span
 
 _OPERATION_NAME_RE = re.compile(r"\b(?:query|mutation|subscription)\s+(\w+)")
 HeaderProvider = Mapping[str, str] | Callable[[], Mapping[str, str]]
@@ -241,7 +241,7 @@ class GraphQLClient:
         after_variable: str = "after",
     ) -> JSONDict:
         body = {"query": query, "variables": variables or {}}
-        with event(
+        with span(
             "graphql_query",
             level="debug",
             graphql_client=self.label,
