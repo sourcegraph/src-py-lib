@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Final, cast
+from typing import Final
 from urllib.parse import urlsplit
 
 from src_py_lib.clients.graphql import GraphQLClient, stream_connection_nodes
@@ -473,7 +473,7 @@ def summarize_jaeger_trace(
                 }
             )
 
-    hot_operations = [
+    hot_operations: list[JSONDict] = [
         {
             "operation": operation,
             "count": len(durations),
@@ -482,18 +482,23 @@ def summarize_jaeger_trace(
         }
         for operation, durations in durations_by_operation.items()
     ]
-    hot_operations.sort(key=lambda operation: float(operation["sum_ms"]), reverse=True)
+    hot_operations.sort(key=jaeger_summary_operation_sum_ms, reverse=True)
     return SourcegraphJaegerTraceSummary(
         trace=trace_metadata,
         jaeger_found=True,
         span_count=len(spans),
-        hot_operations=tuple(cast(JSONDict, operation) for operation in hot_operations[:10]),
+        hot_operations=tuple(hot_operations[:10]),
         graphql_operations=tuple(
             {"operation": operation, "count": count}
             for operation, count in graphql_operations.most_common(10)
         ),
         errored_spans=tuple(errored_spans[:5]),
     )
+
+
+def jaeger_summary_operation_sum_ms(operation: JSONDict) -> float:
+    """Return the total duration for sorting compact Jaeger operation summaries."""
+    return float_value(operation.get("sum_ms"))
 
 
 def jaeger_span_tags(span: JSONDict) -> dict[str, object]:
