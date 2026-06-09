@@ -30,6 +30,7 @@ if sys.platform != "win32":
 
 from pydantic import model_validator
 
+from src_py_lib.utils import telemetry
 from src_py_lib.utils.config import Config, config_field, config_snapshot
 
 RUN: Final[str] = secrets.token_hex(4)
@@ -40,8 +41,6 @@ SRC_LOG_LEVEL: Final[str] = "SRC_LOG_LEVEL"
 SRC_LOG_VERBOSE: Final[str] = "SRC_LOG_VERBOSE"
 SRC_LOG_QUIET: Final[str] = "SRC_LOG_QUIET"
 SRC_LOG_SILENT: Final[str] = "SRC_LOG_SILENT"
-TRACE_ID_BYTES: Final[int] = 16
-SPAN_ID_BYTES: Final[int] = 8
 MEBIBYTE: Final[int] = 1024 * 1024
 REDACTED_LOG_VALUE: Final[str] = "[redacted]"
 SECRET_FIELD_FRAGMENTS: Final[tuple[str, ...]] = (
@@ -74,6 +73,9 @@ _HTTPCORE_RESPONSE_HEADERS_PREFIX: Final[str] = "receive_response_headers.comple
 _HTTPX_REQUEST_PREFIX: Final[str] = "HTTP Request: "
 _HTTP_DEPENDENCY_LOGGER_PREFIXES: Final[tuple[str, ...]] = ("httpx", "httpcore")
 _CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("src_py_lib_log_context")
+_PARENT_SPAN_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "src_py_lib_parent_span_id", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ class LoggingSettings:
     retain_log_files: int = DEFAULT_RETAIN_FILES
     suppress_http_dependency_logs: bool = True
     resource_sample_interval_seconds: float | None = None
+    open_telemetry: telemetry.OpenTelemetrySettings | None = None
 
 
 class LoggingConfig(Config):
@@ -178,6 +181,7 @@ def logging_settings_from_config(
     retain_log_files: int = DEFAULT_RETAIN_FILES,
     suppress_http_dependency_logs: bool = True,
     resource_sample_interval_seconds: float | None = None,
+    open_telemetry: telemetry.OpenTelemetrySettings | None = None,
 ) -> LoggingSettings:
     """Return `LoggingSettings` using common CLI log-level alias."""
     explicit_level = resolve_log_level_name(config)
@@ -191,54 +195,9 @@ def logging_settings_from_config(
         retain_log_files=retain_log_files,
         suppress_http_dependency_logs=suppress_http_dependency_logs,
         resource_sample_interval_seconds=resource_sample_interval_seconds,
+        open_telemetry=open_telemetry,
     )
 
-
-@dataclass(frozen=True)
-class TraceContext:
-    """W3C-compatible trace/span identifiers for logs and outbound requests."""
-
-    trace_id: str
-    span_id: str
-    parent_span_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not _is_hex_identifier(self.trace_id, TRACE_ID_BYTES * 2):
-            raise ValueError("trace_id must be a non-zero 32-character hex string")
-        if not _is_hex_identifier(self.span_id, SPAN_ID_BYTES * 2):
-            raise ValueError("span_id must be a non-zero 16-character hex string")
-        if self.parent_span_id is not None and not _is_hex_identifier(
-            self.parent_span_id, SPAN_ID_BYTES * 2
-        ):
-            raise ValueError("parent_span_id must be a non-zero 16-character hex string")
-
-    @property
-    def trace(self) -> str:
-        """Return the log-field trace identifier."""
-        return self.trace_id
-
-    @property
-    def span(self) -> str:
-        """Return the log-field span identifier."""
-        return self.span_id
-
-    @property
-    def parent_span(self) -> str | None:
-        """Return the log-field parent span identifier."""
-        return self.parent_span_id
-
-    def child(self) -> TraceContext:
-        """Return a child span in the same trace."""
-        return new_trace_context(self)
-
-    def traceparent(self, *, sampled: bool = True) -> str:
-        """Return this context as a W3C traceparent header value."""
-        return traceparent_header(self, sampled=sampled)
-
-
-_SPAN_CONTEXT: contextvars.ContextVar[TraceContext | None] = contextvars.ContextVar(
-    "src_py_lib_span_context", default=None
-)
 
 _HTTP_METRICS_LOCK: Final[threading.Lock] = threading.Lock()
 _HTTP_METRICS: dict[str, int] = {
@@ -527,50 +486,62 @@ def logging_context(
     resolved_logging_config = logging_config or LoggingSettings(
         log_file_level=_src_log_level_from_config(config)
     )
+    open_telemetry_runtime = telemetry.configure_open_telemetry(
+        resolved_logging_config.open_telemetry or telemetry.OpenTelemetrySettings()
+    )
     log_file = configure_logging(resolved_logging_config)
     sampler = _resource_sampler(resolved_logging_config)
     started = time.perf_counter()
     error: BaseException | None = None
-    with log_context(command=name):
-        if sampler is not None:
-            sampler.start()
-        start_fields = {"phase": "start", **dict(run_fields or {})}
-        info("run", logger_name=resolved_logging_config.logger_name, **start_fields)
-        try:
-            startup_event(
-                command=name,
-                config=config,
-                log_file=log_file,
-                git_cwd=_git_cwd_path(git_cwd),
-                logger_name=resolved_logging_config.logger_name,
-            )
-            yield log_file
-        except BaseException as exception:
-            error = exception
-            raise
-        finally:
-            error_type = _run_error_type(error)
-            summary: dict[str, Any] = {}
+    try:
+        with (
+            log_context(command=name),
+            telemetry.open_telemetry_span(name, {"command": name, **dict(run_fields or {})}),
+        ):
             if sampler is not None:
-                summary.update(sampler.stop_and_summary())
-            summary.update(observability_summary())
-            summary["exit_code"] = _run_exit_code(error)
-            if run_summary is not None:
-                summary.update(dict(run_summary()))
-            end_fields = {
-                "phase": "end",
-                "duration_ms": round((time.perf_counter() - started) * 1000.0),
-                "status": "error" if error_type else "ok",
-                "error_type": error_type,
-                **dict(run_fields or {}),
-                **summary,
-            }
-            log(
-                "error" if error_type else "info",
-                "run",
-                logger_name=resolved_logging_config.logger_name,
-                **end_fields,
-            )
+                sampler.start()
+            start_fields = {"phase": "start", **dict(run_fields or {})}
+            info("run", logger_name=resolved_logging_config.logger_name, **start_fields)
+            try:
+                startup_event(
+                    command=name,
+                    config=config,
+                    log_file=log_file,
+                    git_cwd=_git_cwd_path(git_cwd),
+                    logger_name=resolved_logging_config.logger_name,
+                )
+                yield log_file
+            except BaseException as exception:
+                error = exception
+                raise
+            finally:
+                error_type = _run_error_type(error)
+                summary: dict[str, Any] = {}
+                if sampler is not None:
+                    summary.update(sampler.stop_and_summary())
+                summary.update(observability_summary())
+                summary["exit_code"] = _run_exit_code(error)
+                if run_summary is not None:
+                    summary.update(dict(run_summary()))
+                end_fields = {
+                    "phase": "end",
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0),
+                    "status": "error" if error_type else "ok",
+                    "error_type": error_type,
+                    **dict(run_fields or {}),
+                    **summary,
+                }
+                telemetry.set_current_span_attributes(end_fields)
+                if error_type:
+                    telemetry.mark_current_span_error(error_type)
+                log(
+                    "error" if error_type else "info",
+                    "run",
+                    logger_name=resolved_logging_config.logger_name,
+                    **end_fields,
+                )
+    finally:
+        open_telemetry_runtime.force_flush()
 
 
 def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Path:
@@ -586,6 +557,7 @@ def log(level: str, key: str, *, logger_name: str = "", **fields: Any) -> None:
     logger = logging.getLogger(logger_name)
     if not logger.isEnabledFor(numeric_level):
         return
+    telemetry.add_current_span_event(key, {"level": logging.getLevelName(numeric_level), **fields})
     logger.log(
         numeric_level,
         "event=%s",
@@ -639,68 +611,6 @@ def stage(name: str, **fields: Any) -> Generator[None]:
         yield
 
 
-def current_trace_context() -> TraceContext | None:
-    """Return the current logging trace/span context, if one is active."""
-    return _SPAN_CONTEXT.get()
-
-
-def new_trace_context(parent: TraceContext | None = None) -> TraceContext:
-    """Return a root or child trace/span context.
-
-    When `parent` is omitted, the current context is used as the parent when
-    available. Otherwise a new root trace is created.
-    """
-    resolved_parent = parent if parent is not None else current_trace_context()
-    if resolved_parent is None:
-        return TraceContext(
-            trace_id=_nonzero_hex(TRACE_ID_BYTES),
-            span_id=_nonzero_hex(SPAN_ID_BYTES),
-        )
-    return TraceContext(
-        trace_id=resolved_parent.trace_id,
-        span_id=_nonzero_hex(SPAN_ID_BYTES),
-        parent_span_id=resolved_parent.span_id,
-    )
-
-
-@contextlib.contextmanager
-def trace_context(context: TraceContext | None = None) -> Generator[TraceContext]:
-    """Set a trace/span context for nested logs and outbound requests."""
-    resolved_context = context or new_trace_context()
-    reset_token = _SPAN_CONTEXT.set(resolved_context)
-    try:
-        yield resolved_context
-    finally:
-        _SPAN_CONTEXT.reset(reset_token)
-
-
-def traceparent_header(context: TraceContext | None = None, *, sampled: bool = True) -> str:
-    """Return a W3C traceparent header for `context` or the current context."""
-    resolved_context = context or current_trace_context() or new_trace_context()
-    flags = "01" if sampled else "00"
-    return f"00-{resolved_context.trace_id}-{resolved_context.span_id}-{flags}"
-
-
-def sampled_traceparent(context: TraceContext | None = None) -> str:
-    """Return a sampled W3C traceparent header value."""
-    return traceparent_header(context, sampled=True)
-
-
-def trace_context_from_traceparent(value: str | None) -> TraceContext | None:
-    """Return trace/span identifiers parsed from a W3C traceparent header."""
-    if value is None:
-        return None
-    parts = value.split("-")
-    if len(parts) != 4 or parts[0] != "00":
-        return None
-    trace_id = parts[1].lower()
-    span_id = parts[2].lower()
-    try:
-        return TraceContext(trace_id=trace_id, span_id=span_id)
-    except ValueError:
-        return None
-
-
 @contextlib.contextmanager
 def event(
     key: str,
@@ -712,39 +622,42 @@ def event(
     **fields: Any,
 ) -> Generator[dict[str, Any]]:
     """Emit start/end structured events around a block of work."""
-    span = new_trace_context()
-    reset_token = _SPAN_CONTEXT.set(span)
+    parent_span_id = telemetry.current_span_id()
+    parent_reset_token = _PARENT_SPAN_CONTEXT.set(parent_span_id)
     try:
-        log(start_level or level, key, logger_name=logger_name, phase="start", **fields)
-        started = time.perf_counter()
-        extra: dict[str, Any] = {}
-        error: BaseException | None = None
-        try:
-            yield extra
-        except BaseException as exception:
-            error = exception
-            raise
-        finally:
-            end_fields = {
-                **fields,
-                **extra,
-                "phase": "end",
-                "duration_ms": round((time.perf_counter() - started) * 1000.0),
-            }
-            if error:
-                end_fields["status"] = "error"
-                end_fields["error_type"] = type(error).__name__
-            elif not omit_success_status:
-                end_fields["status"] = "ok"
-                end_fields["error_type"] = None
-            log(
-                "error" if error else level,
-                key,
-                logger_name=logger_name,
-                **end_fields,
-            )
+        with telemetry.open_telemetry_span(key, fields):
+            log(start_level or level, key, logger_name=logger_name, phase="start", **fields)
+            started = time.perf_counter()
+            extra: dict[str, Any] = {}
+            error: BaseException | None = None
+            try:
+                yield extra
+            except BaseException as exception:
+                error = exception
+                raise
+            finally:
+                end_fields = {
+                    **fields,
+                    **extra,
+                    "phase": "end",
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0),
+                }
+                if error:
+                    end_fields["status"] = "error"
+                    end_fields["error_type"] = type(error).__name__
+                    telemetry.mark_current_span_error(type(error).__name__)
+                elif not omit_success_status:
+                    end_fields["status"] = "ok"
+                    end_fields["error_type"] = None
+                telemetry.set_current_span_attributes(end_fields)
+                log(
+                    "error" if error else level,
+                    key,
+                    logger_name=logger_name,
+                    **end_fields,
+                )
     finally:
-        _SPAN_CONTEXT.reset(reset_token)
+        _PARENT_SPAN_CONTEXT.reset(parent_reset_token)
 
 
 def submit_with_log_context(
@@ -788,15 +701,10 @@ def sanitized_config_snapshot(config: object) -> dict[str, Any]:
 def _current_log_fields(protected: Mapping[str, Any] | None = None) -> dict[str, Any]:
     protected_keys = set(protected or {})
     fields = {key: value for key, value in _CONTEXT.get({}).items() if key not in protected_keys}
-    span = _SPAN_CONTEXT.get()
-    if span is None:
-        return fields
-    if "parent_span" not in protected_keys and span.parent_span is not None:
-        fields["parent_span"] = span.parent_span
-    if "span" not in protected_keys:
-        fields["span"] = span.span
-    if "trace" not in protected_keys:
-        fields["trace"] = span.trace
+    trace_fields = telemetry.current_trace_fields(_PARENT_SPAN_CONTEXT.get())
+    for key, value in trace_fields.items():
+        if key not in protected_keys:
+            fields[key] = value
     return fields
 
 
@@ -960,22 +868,6 @@ def _decode_http_bytes(value: object) -> str | None:
     if isinstance(value, str):
         return value
     return None
-
-
-def _nonzero_hex(byte_count: int) -> str:
-    while True:
-        value = secrets.token_hex(byte_count)
-        if any(character != "0" for character in value):
-            return value
-
-
-def _is_hex_identifier(value: str, length: int) -> bool:
-    lowered = value.lower()
-    return (
-        len(lowered) == length
-        and any(character != "0" for character in lowered)
-        and all(character in "0123456789abcdef" for character in lowered)
-    )
 
 
 def _is_sensitive_log_field(name: str) -> bool:

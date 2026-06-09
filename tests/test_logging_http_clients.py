@@ -1041,6 +1041,7 @@ class LoggingTest(unittest.TestCase):
             self.assertEqual(rows[-1]["answer"], 42)
 
     def test_event_context_adds_trace_and_span_fields(self) -> None:
+        src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
             logger_name = "src_py_lib_test_traces"
@@ -1129,20 +1130,20 @@ class LoggingTest(unittest.TestCase):
             self.assertEqual(inner_log["span"], inner_start["span"])
             self.assertEqual(inner_log["parent_span"], outer_start["span"])
 
-    def test_trace_context_helpers_generate_w3c_traceparent_headers(self) -> None:
-        root = src.new_trace_context()
-        child = root.child()
+    def test_otel_helpers_return_current_w3c_traceparent_fields(self) -> None:
+        src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
 
-        self.assertEqual(len(root.trace_id), 32)
-        self.assertEqual(len(root.span_id), 16)
-        self.assertEqual(child.trace_id, root.trace_id)
-        self.assertEqual(child.parent_span_id, root.span_id)
-        self.assertRegex(root.traceparent(), r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
-        self.assertEqual(src.trace_context_from_traceparent(root.traceparent()), root)
+        with event("traceparent_test"):
+            traceparent = src.current_traceparent_header()
+            self.assertIsNotNone(traceparent)
+            assert traceparent is not None
+            traceparent_parts = traceparent.split("-")
 
-        with src.trace_context(root):
-            self.assertEqual(src.current_trace_context(), root)
-            self.assertEqual(src.traceparent_header(), root.traceparent())
+            self.assertRegex(traceparent, r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+            self.assertEqual(
+                src.traceparent_fields(traceparent),
+                {"trace_id": traceparent_parts[1], "span_id": traceparent_parts[2]},
+            )
 
     def test_event_can_lower_start_level_and_omit_success_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1617,7 +1618,8 @@ query Users($first: Int!, $after: String) {
         self.assertIn("SourcegraphClientValidate", str(body.get("query") or ""))
         self.assertIn("currentUser", str(body.get("query") or ""))
 
-    def test_sourcegraph_trace_mode_records_and_streams_jaeger_summary(self) -> None:
+    def test_sourcegraph_debug_trace_mode_records_and_streams_jaeger_summary(self) -> None:
+        src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
         trace_id = "1" * 32
         span_id = "2" * 16
         requests: list[httpx.Request] = []
@@ -1664,11 +1666,10 @@ query Users($first: Int!, $after: String) {
             "https://sourcegraph.example.com/",
             "token",
             http=HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler)),
-            trace=True,
+            fetch_sg_traces=True,
         )
-        root_context = src.TraceContext(trace_id="3" * 32, span_id="4" * 16)
 
-        with src.trace_context(root_context):
+        with event("sourcegraph_test"):
             self.assertEqual(
                 client.graphql("query Viewer { currentUser { username } }", follow_pages=False),
                 {"currentUser": {"username": "alice"}},
@@ -1680,11 +1681,10 @@ query Users($first: Int!, $after: String) {
         traceparent = requests[0].headers["traceparent"]
         traceparent_parts = traceparent.split("-")
         self.assertEqual(requests[0].headers["x-sourcegraph-request-trace"], "true")
-        self.assertRegex(traceparent, r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
-        self.assertEqual(traceparent_parts[1], root_context.trace_id)
+        self.assertRegex(traceparent, r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
         self.assertEqual(traces[0].trace_id, trace_id)
         self.assertEqual(traces[0].span_id, span_id)
-        self.assertEqual(traces[0].parent_trace_id, root_context.trace_id)
+        self.assertEqual(traces[0].parent_trace_id, traceparent_parts[1])
         self.assertEqual(traces[0].parent_span_id, traceparent_parts[2])
         self.assertEqual(len(summaries), 1)
         self.assertTrue(summaries[0].jaeger_found)
