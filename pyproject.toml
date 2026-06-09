@@ -4,6 +4,8 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "opentelemetry-exporter-otlp-proto-http>=1.38.0,<2",
+    "opentelemetry-sdk>=1.38.0,<2",
     "pyright>=1.1.410",
     "ruff>=0.15.16",
 ]

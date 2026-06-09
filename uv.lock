@@ -482,6 +482,8 @@ otel = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
     { name = "pyright" },
     { name = "ruff" },
 ]
@@ -499,6 +501,8 @@ provides-extras = ["otel"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38.0,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.38.0,<2" },
     { name = "pyright", specifier = ">=1.1.410" },
     { name = "ruff", specifier = ">=0.15.16" },
 ]
