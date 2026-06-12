@@ -59,6 +59,15 @@ from src_py_lib.utils.config import (
 from src_py_lib.utils.config import (
     config_parse_args as parse_args,
 )
+from src_py_lib.utils.events import (
+    CallbackEventSink,
+    CompositeEventSink,
+    EventRuntime,
+    EventSink,
+    InMemoryEventSink,
+    JSONLEventSink,
+    NullEventSink,
+)
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_cache import load_json_cache, load_json_subset, save_json_cache
 from src_py_lib.utils.json_types import (
@@ -71,17 +80,19 @@ from src_py_lib.utils.json_types import (
     json_strs,
 )
 from src_py_lib.utils.logging import (
+    EventBridgeHandler,
     LoggingConfig,
     LoggingSettings,
-    configure_logging,
+    cli_logging_handlers,
+    cli_run_context,
     critical,
     debug,
     error,
     info,
     log_context,
     log_event,
-    logging_context,
     logging_settings_from_config,
+    observability_context,
     resolve_log_level_name,
     span,
     stage,
@@ -94,6 +105,7 @@ from src_py_lib.utils.telemetry import (
     OpenTelemetryRuntime,
     OpenTelemetrySettings,
     OpenTelemetrySetupError,
+    OtelLogsSink,
     configure_open_telemetry,
     current_traceparent_header,
     open_telemetry_settings_from_config,
@@ -111,13 +123,20 @@ def logging(
     open_telemetry: OpenTelemetrySettings | None = None,
     run_fields: Mapping[str, Any] | None = None,
     run_summary: Callable[[], Mapping[str, Any]] | None = None,
+    resource: Mapping[str, Any] | None = None,
 ) -> AbstractContextManager[Path | None]:
-    """Configure standard CLI logging and emit startup metadata."""
+    """Configure standard CLI-mode logging for one run and emit startup metadata.
+
+    CLI mode: installs terminal and event-bridge handlers on the configured
+    package loggers (never the root logger) and writes the JSONL event log.
+    Importable-module callers should use `observability_context()` instead,
+    which never touches stdlib logging handlers.
+    """
     resolved_logging_config = logging_config
     if open_telemetry is not None:
         resolved_logging_config = logging_config or logging_settings_from_config(config)
         resolved_logging_config = LoggingSettings(
-            logger_name=resolved_logging_config.logger_name,
+            logger_names=resolved_logging_config.logger_names,
             terminal_level=resolved_logging_config.terminal_level,
             log_file_level=resolved_logging_config.log_file_level,
             log_file=resolved_logging_config.log_file,
@@ -130,13 +149,14 @@ def logging(
             ),
             open_telemetry=open_telemetry,
         )
-    return logging_context(
+    return cli_run_context(
         command or _script_name(),
         config,
         git_cwd=git_cwd,
         logging_config=resolved_logging_config,
         run_fields=run_fields,
         run_summary=run_summary,
+        resource=resource,
     )
 
 
@@ -145,8 +165,13 @@ def _script_name() -> str:
 
 
 __all__ = [
+    "CallbackEventSink",
+    "CompositeEventSink",
     "Config",
     "ConfigError",
+    "EventBridgeHandler",
+    "EventRuntime",
+    "EventSink",
     "GraphQLError",
     "GraphQLClient",
     "GitHubClient",
@@ -155,15 +180,19 @@ __all__ = [
     "HTTPClient",
     "HTTPClientError",
     "HTTPResponse",
+    "InMemoryEventSink",
     "JSONDict",
+    "JSONLEventSink",
     "LinearClient",
     "LinearClientConfig",
     "LoggingConfig",
     "LoggingSettings",
+    "NullEventSink",
     "OpenTelemetryConfig",
     "OpenTelemetryRuntime",
     "OpenTelemetrySettings",
     "OpenTelemetrySetupError",
+    "OtelLogsSink",
     "PullRequest",
     "SlackClient",
     "SlackClientConfig",
@@ -178,9 +207,10 @@ __all__ = [
     "config_field",
     "config_field_names",
     "config_help_formatter",
+    "cli_logging_handlers",
+    "cli_run_context",
     "config_snapshot",
     "configure_open_telemetry",
-    "configure_logging",
     "critical",
     "current_traceparent_header",
     "debug",
@@ -205,11 +235,11 @@ __all__ = [
     "load_json_cache",
     "load_json_subset",
     "logging",
-    "logging_context",
     "logging_settings_from_config",
     "log_event",
     "log_context",
     "normalize_sourcegraph_endpoint",
+    "observability_context",
     "open_telemetry_settings_from_config",
     "parse_args",
     "pr_ref_from_url",
