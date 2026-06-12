@@ -6,17 +6,25 @@ import argparse
 import io
 import json
 import logging
+import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from collections.abc import Mapping
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import httpx
+from opentelemetry import trace
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import src_py_lib as src
 from src_py_lib.clients.github import GitHubClient, graphql_api_url, pr_ref_from_url
@@ -59,25 +67,39 @@ from src_py_lib.utils.config import (
     load_config_from_args,
     resolve_config_refs,
 )
+from src_py_lib.utils.events import (
+    EVENT_FIELD_ORDER,
+    CallbackEventSink,
+    CompositeEventSink,
+    InMemoryEventSink,
+    JSONLEventSink,
+    NullEventSink,
+    current_event_runtime,
+    ordered_event_payload,
+    severity_fields,
+)
 from src_py_lib.utils.http import HTTPClient, HTTPClientError, HTTPResponse
 from src_py_lib.utils.json_types import JSONDict, json_dict, json_list
 from src_py_lib.utils.logging import (
+    EventBridgeHandler,
     LoggingConfig,
     LoggingSettings,
-    configure_logging,
+    cli_logging_handlers,
     critical,
     debug,
     default_log_file,
     error,
     info,
-    log_context,
     log_event,
     logging_settings_from_config,
+    observability_context,
     resolve_log_level_name,
     span,
+    stage,
     startup_event,
     warning,
 )
+from src_py_lib.utils.telemetry import OtelLogsSink
 
 
 class RecordingHTTP(HTTPClient):
@@ -109,6 +131,29 @@ class RecordingHTTP(HTTPClient):
         if self.responses:
             return self.responses.pop(0)
         return {"data": {"viewer": {"username": "alice"}}}
+
+
+class RecordingLogHandler(logging.Handler):
+    """Stdlib logging handler that collects records for isolation assertions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def events_named(events: list[dict[str, Any]], event_name: str) -> list[dict[str, Any]]:
+    """Return the structured events with the given event name."""
+    return [event for event in events if event["event_name"] == event_name]
+
+
+def phase_event(events: list[dict[str, Any]], event_name: str, phase: str) -> dict[str, Any]:
+    """Return the first event with the given name and `phase` attribute."""
+    return next(
+        event for event in events_named(events, event_name) if event["attributes"]["phase"] == phase
+    )
 
 
 class FakeOnePasswordClient(OnePasswordClient):
@@ -849,6 +894,88 @@ class GraphQLTest(unittest.TestCase):
             self.assertEqual(json.loads(output_file.read_text(encoding="utf-8")), schema)
 
 
+class EventSinkTest(unittest.TestCase):
+    def test_severity_fields_maps_python_levels_to_otel_pairs(self) -> None:
+        self.assertEqual(severity_fields(logging.DEBUG), ("DEBUG", 5))
+        self.assertEqual(severity_fields(logging.INFO), ("INFO", 9))
+        self.assertEqual(severity_fields(logging.WARNING), ("WARN", 13))
+        self.assertEqual(severity_fields(logging.ERROR), ("ERROR", 17))
+        self.assertEqual(severity_fields(logging.CRITICAL), ("FATAL", 21))
+        self.assertEqual(severity_fields(35), ("WARN", 13))
+        self.assertEqual(severity_fields(15), ("DEBUG", 5))
+        self.assertEqual(severity_fields(1), ("TRACE", 1))
+
+    def test_ordered_event_payload_puts_model_fields_first_and_sorts_attributes(self) -> None:
+        payload: dict[str, Any] = {
+            "attributes": {"zulu": 1, "alpha": 2},
+            "custom_extra": True,
+            "event_name": "example",
+            "severity_number": 9,
+            "severity_text": "INFO",
+            "time_unix_nano": 123,
+        }
+
+        ordered = ordered_event_payload(payload)
+
+        self.assertEqual(
+            list(ordered),
+            [
+                "time_unix_nano",
+                "severity_text",
+                "severity_number",
+                "event_name",
+                "attributes",
+                "custom_extra",
+            ],
+        )
+        self.assertEqual(list(ordered["attributes"]), ["alpha", "zulu"])
+
+    def test_jsonl_event_sink_is_thread_safe_and_ignores_emit_after_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "events.json"
+            sink = JSONLEventSink(path)
+
+            def emit_batch(worker: int) -> None:
+                for index in range(50):
+                    sink.emit(
+                        {
+                            "event_name": f"event_{worker}_{index}",
+                            "attributes": {"worker": worker},
+                        }
+                    )
+
+            workers = [threading.Thread(target=emit_batch, args=(worker,)) for worker in range(8)]
+            for worker_thread in workers:
+                worker_thread.start()
+            for worker_thread in workers:
+                worker_thread.join()
+            sink.close()
+            sink.emit({"event_name": "after_close", "attributes": {}})
+
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 400)
+            self.assertEqual(events_named(rows, "after_close"), [])
+
+    def test_composite_sink_fans_out_and_sinks_receive_copies(self) -> None:
+        received: list[dict[str, Any]] = []
+
+        def mutating_callback(event: dict[str, Any]) -> None:
+            received.append(event)
+            event["mutated"] = True
+
+        memory = InMemoryEventSink()
+        composite = CompositeEventSink((CallbackEventSink(mutating_callback), memory))
+        original: dict[str, Any] = {"event_name": "example", "attributes": {"answer": 42}}
+
+        composite.emit(original)
+
+        self.assertEqual(received[0]["event_name"], "example")
+        self.assertNotIn("mutated", original)
+        self.assertNotIn("mutated", memory.events[0])
+        memory.events[0]["stored_mutation"] = True
+        self.assertNotIn("stored_mutation", original)
+
+
 class LoggingTest(unittest.TestCase):
     def test_default_log_file_uses_dashed_timestamp_offset_and_run(self) -> None:
         path = default_log_file(Path("logs"), run="1ea51330")
@@ -859,276 +986,305 @@ class LoggingTest(unittest.TestCase):
             r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{4}-1ea51330\.json$",
         )
 
-    def test_configure_logging_defaults_log_file_under_logs_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            logs_dir = Path(directory) / "logs"
-            logger_name = "src_py_lib_test_default_logs_dir"
-            log_file = configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
-                    terminal_level="critical",
-                    logs_dir=logs_dir,
-                    run="test-run",
-                )
-            )
-            try:
-                info("default_log_path", logger_name=logger_name)
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+    def test_span_and_log_event_default_to_null_sink_outside_runs(self) -> None:
+        self.assertIsInstance(current_event_runtime().sink, NullEventSink)
 
-            if log_file is None:
-                self.fail("configure_logging did not return a default log file")
-            self.assertEqual(log_file.parent, logs_dir)
-            self.assertRegex(
-                log_file.name,
-                r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{4}-test-run\.json$",
-            )
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            self.assertTrue(any(row.get("event") == "default_log_path" for row in rows))
+        with span("no_context_span") as extra:
+            extra["answer"] = 42
+            log_event("info", "no_context_event", logger_name="ignored", answer=42)
 
-    def test_src_log_level_env_controls_log_file_level(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "src_py_lib_test_log_level"
-            with patch.dict("os.environ", {"SRC_LOG_LEVEL": "INFO"}):
-                configure_logging(
-                    LoggingSettings(
-                        logger_name=logger_name,
-                        terminal_level="critical",
-                        log_file=log_file,
-                        run="test-run",
-                    )
-                )
-            try:
-                debug("debug_event", logger_name=logger_name)
-                info("info_event", logger_name=logger_name)
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+    def test_observability_context_leaves_root_logger_and_files_untouched(self) -> None:
+        root_logger = logging.getLogger()
+        handlers_before = list(root_logger.handlers)
+        level_before = root_logger.level
+        sink = InMemoryEventSink()
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            events = [row["event"] for row in rows]
-            self.assertNotIn("debug_event", events)
-            self.assertIn("info_event", events)
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            with observability_context("guest-test", sink=sink, run="test-run"):
+                self.assertEqual(list(root_logger.handlers), handlers_before)
+                self.assertEqual(root_logger.level, level_before)
+                with span("guest_span"):
+                    info("guest_event", answer=42)
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_log_and_level_helpers_use_string_levels(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "src_py_lib_test_string_levels"
-            configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
-                    terminal_level="critical",
-                    log_file_level="debug",
-                    log_file=log_file,
-                    run="test-run",
-                )
-            )
-            try:
-                log_event("bogus", "fallback_info", logger_name=logger_name)
-                warning("warning_event", logger_name=logger_name)
-                error("error_event", logger_name=logger_name)
-                critical("critical_event", logger_name=logger_name)
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+        self.assertEqual(list(root_logger.handlers), handlers_before)
+        self.assertEqual(root_logger.level, level_before)
+        self.assertEqual(len(events_named(sink.events, "guest_event")), 1)
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            levels = {row["event"]: row["level"] for row in rows}
-            self.assertEqual(levels["fallback_info"], "INFO")
-            self.assertEqual(levels["warning_event"], "WARNING")
-            self.assertEqual(levels["error_event"], "ERROR")
-            self.assertEqual(levels["critical_event"], "CRITICAL")
+    def test_observability_context_emits_run_startup_and_run_end_events(self) -> None:
+        sink = InMemoryEventSink()
+        config = ExampleConfig(token="secret-token")
 
-    def test_logging_configures_logging_context_and_startup(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "src_py_lib_test_logging_context"
-            config = ExampleConfig(token="secret-token")
-            try:
-                with src.logging(
-                    config,
-                    command="unit-test",
-                    git_cwd=__file__,
-                    logging_config=LoggingSettings(
-                        logger_name=logger_name,
-                        terminal_level="critical",
-                        log_file=log_file,
-                        run="test-run",
-                    ),
-                ) as context_log_file:
-                    self.assertEqual(context_log_file, log_file)
-                    info("inside_command", logger_name=logger_name)
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+        with observability_context(
+            "unit-test",
+            config,
+            sink=sink,
+            run="test-run",
+            run_fields={"endpoint": "https://example.com"},
+            resource={"service.name": "unit-test-service"},
+        ):
+            info("inside_command", answer=42)
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            startup = next(row for row in rows if row["event"] == "startup")
-            inside = next(row for row in rows if row["event"] == "inside_command")
-            self.assertEqual(startup["command"], "unit-test")
-            self.assertEqual(startup["config"]["EXAMPLE_TOKEN"], "provided")
-            self.assertEqual(inside["command"], "unit-test")
+        run_start = phase_event(sink.events, "run", "start")
+        self.assertEqual(run_start["severity_text"], "DEBUG")
+        self.assertEqual(run_start["severity_number"], 5)
+        self.assertEqual(run_start["resource"]["process.pid"], os.getpid())
+        self.assertEqual(run_start["resource"]["process.runtime.name"], sys.implementation.name)
+        self.assertEqual(run_start["resource"]["process.runtime.version"], sys.version.split()[0])
+        self.assertEqual(run_start["resource"]["service.name"], "unit-test-service")
 
-    def test_structured_log_file_includes_context_and_sanitized_terminal_omits_event(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "src_py_lib_test_logging"
-            configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
-                    terminal_level="info",
-                    log_file=log_file,
-                    run="test-run",
-                )
-            )
-            try:
-                startup_event(
-                    command="unit-test",
-                    logger_name=logger_name,
-                    git_commit="abc1234",
-                )
-                with log_context(command="unit-test"):
-                    info("example", logger_name=logger_name, answer=42)
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+        startup = events_named(sink.events, "startup")[0]
+        self.assertEqual(startup["severity_text"], "INFO")
+        self.assertNotIn("resource", startup)
+        self.assertEqual(startup["attributes"]["command"], "unit-test")
+        self.assertEqual(startup["attributes"]["run"], "test-run")
+        self.assertEqual(startup["attributes"]["config"]["EXAMPLE_TOKEN"], "provided")
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            startup = next(row for row in rows if row["event"] == "startup")
-            self.assertEqual(startup["git_commit"], "abc1234")
-            self.assertFalse(any("git_commit" in row for row in rows if row["event"] != "startup"))
-            self.assertEqual(
-                list(rows[0]),
-                ["ts", "level", "run", "logger", "event", "message"],
-            )
-            self.assertEqual(
-                rows[0]["message"],
-                f"Writing log events to {log_file}.",
-            )
-            self.assertEqual(
-                list(startup),
-                [
-                    "ts",
-                    "command",
-                    "level",
-                    "run",
-                    "event",
-                    "git_commit",
-                    "log_file",
-                ],
-            )
-            self.assertEqual(
-                list(rows[-1]),
-                ["ts", "command", "level", "run", "event", "answer"],
-            )
-            self.assertEqual(rows[-1]["event"], "example")
-            self.assertEqual(rows[-1]["run"], "test-run")
-            self.assertEqual(rows[-1]["command"], "unit-test")
-            self.assertEqual(rows[-1]["answer"], 42)
+        inside = events_named(sink.events, "inside_command")[0]
+        self.assertEqual(inside["attributes"]["command"], "unit-test")
+        self.assertEqual(inside["attributes"]["answer"], 42)
+        self.assertIsInstance(inside["time_unix_nano"], int)
+
+        run_end = phase_event(sink.events, "run", "end")
+        self.assertEqual(run_end["severity_text"], "INFO")
+        end_attributes = run_end["attributes"]
+        self.assertEqual(end_attributes["status"], "ok")
+        self.assertIsNone(end_attributes["error.type"])
+        self.assertEqual(end_attributes["exit_code"], 0)
+        self.assertEqual(end_attributes["endpoint"], "https://example.com")
+        self.assertGreaterEqual(end_attributes["duration_ms"], 0)
+        self.assertEqual(end_attributes["http.client.request.count"], 0)
+        self.assertEqual(end_attributes["http.client.retry.count"], 0)
+        self.assertEqual(end_attributes["http.client.transport_error.count"], 0)
+
+    def test_observability_context_records_system_exit_semantics(self) -> None:
+        clean_sink = InMemoryEventSink()
+        with (
+            self.assertRaises(SystemExit),
+            observability_context("unit-test", sink=clean_sink, run="test-run"),
+        ):
+            raise SystemExit(0)
+
+        clean_end = phase_event(clean_sink.events, "run", "end")
+        self.assertEqual(clean_end["severity_text"], "INFO")
+        self.assertEqual(clean_end["attributes"]["status"], "ok")
+        self.assertIsNone(clean_end["attributes"]["error.type"])
+        self.assertEqual(clean_end["attributes"]["exit_code"], 0)
+
+        failing_sink = InMemoryEventSink()
+        with (
+            self.assertRaises(SystemExit),
+            observability_context("unit-test", sink=failing_sink, run="test-run"),
+        ):
+            raise SystemExit(3)
+
+        failing_end = phase_event(failing_sink.events, "run", "end")
+        self.assertEqual(failing_end["severity_text"], "ERROR")
+        self.assertEqual(failing_end["attributes"]["status"], "error")
+        self.assertEqual(failing_end["attributes"]["error.type"], "SystemExit")
+        self.assertEqual(failing_end["attributes"]["exit_code"], 3)
+
+    def test_observability_context_min_level_suppresses_debug_events(self) -> None:
+        sink = InMemoryEventSink()
+
+        with observability_context("unit-test", sink=sink, run="test-run", min_level="info"):
+            debug("hidden_event")
+            info("visible_event")
+
+        names = [event["event_name"] for event in sink.events]
+        self.assertNotIn("hidden_event", names)
+        self.assertIn("visible_event", names)
+        self.assertIn("startup", names)
+        run_phases = [event["attributes"]["phase"] for event in events_named(sink.events, "run")]
+        self.assertEqual(run_phases, ["end"])
+
+    def test_observability_context_resource_sampler_emits_samples_and_summary(self) -> None:
+        sink = InMemoryEventSink()
+
+        with observability_context(
+            "unit-test", sink=sink, run="test-run", resource_sample_interval_seconds=3600
+        ):
+            pass
+
+        samples = events_named(sink.events, "resource_sample")
+        self.assertGreaterEqual(len(samples), 2)
+        for sample in samples:
+            self.assertEqual(sample["severity_text"], "DEBUG")
+            self.assertIn("num_threads", sample["attributes"])
+            self.assertIn("rss_mb", sample["attributes"])
+
+        run_end = phase_event(sink.events, "run", "end")
+        self.assertIn("peak_rss_mb", run_end["attributes"])
+        self.assertIn("cpu_user_seconds", run_end["attributes"])
+        self.assertIn("cpu_system_seconds", run_end["attributes"])
+        self.assertIn("cpu_count_logical", run_end["attributes"])
+
+    def test_observability_context_resource_sampler_interval_zero_summarizes_only(self) -> None:
+        sink = InMemoryEventSink()
+
+        with observability_context(
+            "unit-test", sink=sink, run="test-run", resource_sample_interval_seconds=0
+        ):
+            pass
+
+        self.assertEqual(events_named(sink.events, "resource_sample"), [])
+        run_end = phase_event(sink.events, "run", "end")
+        self.assertIn("peak_rss_mb", run_end["attributes"])
+        self.assertIn("cpu_count_logical", run_end["attributes"])
+
+    def test_log_event_helpers_map_string_levels_to_otel_severity(self) -> None:
+        sink = InMemoryEventSink()
+
+        with observability_context("unit-test", sink=sink, run="test-run"):
+            log_event("bogus", "fallback_info", logger_name="ignored")
+            warning("warning_event")
+            error("error_event")
+            critical("critical_event")
+
+        severities = {
+            event["event_name"]: (event["severity_text"], event["severity_number"])
+            for event in sink.events
+        }
+        self.assertEqual(severities["fallback_info"], ("INFO", 9))
+        self.assertEqual(severities["warning_event"], ("WARN", 13))
+        self.assertEqual(severities["error_event"], ("ERROR", 17))
+        self.assertEqual(severities["critical_event"], ("FATAL", 21))
+
+    def test_stage_adds_attributes_to_nested_events(self) -> None:
+        sink = InMemoryEventSink()
+
+        with (
+            observability_context("unit-test", sink=sink, run="test-run"),
+            stage("sync", tenant="acme"),
+        ):
+            info("staged_event")
+
+        staged = events_named(sink.events, "staged_event")[0]
+        self.assertEqual(staged["attributes"]["stage"], "sync")
+        self.assertEqual(staged["attributes"]["tenant"], "acme")
+        self.assertEqual(staged["attributes"]["command"], "unit-test")
+
+    def test_startup_event_uses_explicit_git_commit(self) -> None:
+        sink = InMemoryEventSink()
+
+        with observability_context("unit-test", sink=sink, run="test-run"):
+            startup_event(command="manual-startup", git_commit="abc1234")
+
+        manual = next(
+            event
+            for event in events_named(sink.events, "startup")
+            if event["attributes"]["command"] == "manual-startup"
+        )
+        self.assertEqual(manual["attributes"]["git_commit"], "abc1234")
+        self.assertIsNone(manual["attributes"]["log_file"])
+
+    def test_span_emits_debug_start_and_wide_end_events(self) -> None:
+        sink = InMemoryEventSink()
+
+        with (
+            observability_context("unit-test", sink=sink, run="test-run"),
+            span("work_unit", items=3) as extra,
+        ):
+            extra["processed"] = 2
+
+        start = phase_event(sink.events, "work_unit", "start")
+        self.assertEqual(start["severity_text"], "DEBUG")
+        self.assertEqual(start["attributes"]["items"], 3)
+
+        end = phase_event(sink.events, "work_unit", "end")
+        self.assertEqual(end["severity_text"], "INFO")
+        end_attributes = end["attributes"]
+        self.assertEqual(end_attributes["items"], 3)
+        self.assertEqual(end_attributes["processed"], 2)
+        self.assertEqual(end_attributes["status"], "ok")
+        self.assertIsNone(end_attributes["error.type"])
+        self.assertGreaterEqual(end_attributes["duration_ms"], 0)
+
+    def test_span_records_error_status_and_error_type(self) -> None:
+        sink = InMemoryEventSink()
+
+        with (
+            observability_context("unit-test", sink=sink, run="test-run"),
+            self.assertRaisesRegex(ValueError, "boom"),
+            span("failing_unit"),
+        ):
+            raise ValueError("boom")
+
+        end = phase_event(sink.events, "failing_unit", "end")
+        self.assertEqual(end["severity_text"], "ERROR")
+        self.assertEqual(end["attributes"]["status"], "error")
+        self.assertEqual(end["attributes"]["error.type"], "ValueError")
+
+    def test_span_can_lower_start_level_and_omit_success_status(self) -> None:
+        sink = InMemoryEventSink()
+
+        with (
+            observability_context("unit-test", sink=sink, run="test-run", min_level="info"),
+            span(
+                "quiet_start",
+                level="info",
+                start_level="debug",
+                omit_success_status=True,
+            ),
+        ):
+            pass
+
+        quiet_events = events_named(sink.events, "quiet_start")
+        self.assertEqual(len(quiet_events), 1)
+        attributes = quiet_events[0]["attributes"]
+        self.assertEqual(attributes["phase"], "end")
+        self.assertNotIn("status", attributes)
+        self.assertNotIn("error.type", attributes)
 
     def test_span_context_adds_trace_and_span_fields(self) -> None:
         src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "src_py_lib_test_traces"
-            configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
-                    terminal_level="info",
-                    log_file=log_file,
-                    run="test-run",
-                )
-            )
-            try:
-                with span("outer", logger_name=logger_name):
-                    info("inside", logger_name=logger_name, answer=42)
-                    with span("inner", logger_name=logger_name):
-                        logging.getLogger(logger_name).info("inside nested span")
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+        sink = InMemoryEventSink()
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            outer_start = next(
-                row for row in rows if row["event"] == "outer" and row["phase"] == "start"
-            )
-            outer_end = next(
-                row for row in rows if row["event"] == "outer" and row["phase"] == "end"
-            )
-            inside = next(row for row in rows if row["event"] == "inside")
-            inner_start = next(
-                row for row in rows if row["event"] == "inner" and row["phase"] == "start"
-            )
-            inner_end = next(
-                row for row in rows if row["event"] == "inner" and row["phase"] == "end"
-            )
-            inner_log = next(row for row in rows if row.get("message") == "inside nested span")
+        with observability_context("trace-test", sink=sink, run="test-run"), span("outer"):
+            info("inside", answer=42)
+            with span("inner"):
+                pass
 
-            self.assertEqual(
-                list(outer_start),
-                ["ts", "level", "run", "trace", "span", "event", "phase"],
-            )
-            self.assertEqual(outer_start["trace"], outer_end["trace"])
-            self.assertEqual(outer_start["span"], outer_end["span"])
-            self.assertEqual(len(outer_start["trace"]), 32)
-            self.assertEqual(len(outer_start["span"]), 16)
-            self.assertNotIn("parent_span", outer_start)
+        run_start = phase_event(sink.events, "run", "start")
+        outer_start = phase_event(sink.events, "outer", "start")
+        outer_end = phase_event(sink.events, "outer", "end")
+        inner_start = phase_event(sink.events, "inner", "start")
+        inner_end = phase_event(sink.events, "inner", "end")
+        inside = events_named(sink.events, "inside")[0]
 
-            self.assertEqual(inside["trace"], outer_start["trace"])
-            self.assertEqual(inside["span"], outer_start["span"])
+        self.assertEqual(len(outer_start["trace_id"]), 32)
+        self.assertEqual(len(outer_start["span_id"]), 16)
+        self.assertEqual(outer_start["trace_id"], outer_end["trace_id"])
+        self.assertEqual(outer_start["span_id"], outer_end["span_id"])
+        self.assertEqual(outer_start["parent_span_id"], run_start["span_id"])
 
-            self.assertEqual(
-                list(inner_start),
-                [
-                    "ts",
-                    "level",
-                    "run",
-                    "trace",
-                    "span",
-                    "parent_span",
-                    "event",
-                    "phase",
-                ],
-            )
-            self.assertEqual(inner_start["trace"], outer_start["trace"])
-            self.assertEqual(inner_start["span"], inner_end["span"])
-            self.assertEqual(len(inner_start["span"]), 16)
-            self.assertEqual(inner_start["parent_span"], outer_start["span"])
-            self.assertNotEqual(inner_start["span"], outer_start["span"])
+        self.assertEqual(inside["trace_id"], outer_start["trace_id"])
+        self.assertEqual(inside["span_id"], outer_start["span_id"])
 
-            self.assertEqual(
-                list(inner_log),
-                [
-                    "ts",
-                    "level",
-                    "run",
-                    "trace",
-                    "span",
-                    "parent_span",
-                    "logger",
-                    "event",
-                    "message",
-                ],
-            )
-            self.assertEqual(inner_log["trace"], outer_start["trace"])
-            self.assertEqual(inner_log["span"], inner_start["span"])
-            self.assertEqual(inner_log["parent_span"], outer_start["span"])
+        self.assertEqual(inner_start["trace_id"], outer_start["trace_id"])
+        self.assertEqual(inner_start["span_id"], inner_end["span_id"])
+        self.assertEqual(len(inner_start["span_id"]), 16)
+        self.assertNotEqual(inner_start["span_id"], outer_start["span_id"])
+        self.assertEqual(inner_start["parent_span_id"], outer_start["span_id"])
+
+    def test_log_event_adds_event_to_recording_otel_span(self) -> None:
+        src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
+        provider = trace.get_tracer_provider()
+        add_span_processor = getattr(provider, "add_span_processor", None)
+        if not callable(add_span_processor):
+            self.skipTest("global tracer provider does not accept span processors")
+        exporter = InMemorySpanExporter()
+        add_span_processor(SimpleSpanProcessor(exporter))
+
+        with span("span_event_holder"):
+            log_event("info", "observed_event", answer=42)
+
+        holder = next(
+            exported
+            for exported in exporter.get_finished_spans()
+            if exported.name == "span_event_holder"
+        )
+        self.assertIn("observed_event", [event.name for event in holder.events])
 
     def test_otel_helpers_return_current_w3c_traceparent_fields(self) -> None:
         src.configure_open_telemetry(src.OpenTelemetrySettings(force_traces=True))
@@ -1145,42 +1301,216 @@ class LoggingTest(unittest.TestCase):
                 {"trace_id": traceparent_parts[1], "span_id": traceparent_parts[2]},
             )
 
-    def test_span_can_lower_start_level_and_omit_success_status(self) -> None:
+
+class CliLoggingHandlersTest(unittest.TestCase):
+    def test_attaches_only_own_handlers_and_restores_prior_state(self) -> None:
+        logger_name = "src_py_lib_test_handler_isolation"
+        named_logger = logging.getLogger(logger_name)
+        named_logger.setLevel(logging.WARNING)
+        root_logger = logging.getLogger()
+        customer_named_handler = RecordingLogHandler()
+        customer_root_handler = RecordingLogHandler()
+        named_logger.addHandler(customer_named_handler)
+        root_logger.addHandler(customer_root_handler)
+        root_handlers_before = list(root_logger.handlers)
+        sink = InMemoryEventSink()
+
+        try:
+            with cli_logging_handlers(
+                sink=sink, logger_names=(logger_name,), terminal_level="critical"
+            ):
+                added = [
+                    handler
+                    for handler in named_logger.handlers
+                    if handler is not customer_named_handler
+                ]
+                self.assertEqual(
+                    {type(handler) for handler in added},
+                    {logging.StreamHandler, EventBridgeHandler},
+                )
+                self.assertEqual(list(root_logger.handlers), root_handlers_before)
+                self.assertEqual(named_logger.level, logging.DEBUG)
+                named_logger.info("customer handlers still see records")
+
+            self.assertEqual(named_logger.handlers, [customer_named_handler])
+            self.assertEqual(named_logger.level, logging.WARNING)
+            self.assertEqual(list(root_logger.handlers), root_handlers_before)
+        finally:
+            named_logger.removeHandler(customer_named_handler)
+            root_logger.removeHandler(customer_root_handler)
+            named_logger.setLevel(logging.NOTSET)
+
+        self.assertEqual(
+            [record.getMessage() for record in customer_named_handler.records],
+            ["customer handlers still see records"],
+        )
+        self.assertEqual(
+            [record.getMessage() for record in customer_root_handler.records],
+            ["customer handlers still see records"],
+        )
+        self.assertEqual([event["event_name"] for event in sink.events], ["log"])
+
+    def test_event_bridge_forwards_human_log_records(self) -> None:
+        sink = InMemoryEventSink()
+
+        with cli_logging_handlers(
+            sink=sink, logger_names=("src_py_lib_test_bridge",), terminal_level="critical"
+        ):
+            logging.getLogger("src_py_lib_test_bridge.module").info("Wrote %s", "x")
+
+        event = events_named(sink.events, "log")[0]
+        self.assertEqual(event["body"], "Wrote x")
+        self.assertEqual(event["severity_text"], "INFO")
+        self.assertEqual(event["attributes"]["logger"], "src_py_lib_test_bridge.module")
+
+    def test_event_bridge_includes_exception_tracebacks(self) -> None:
+        sink = InMemoryEventSink()
+        logger_name = "src_py_lib_test_exception"
+
+        with cli_logging_handlers(
+            sink=sink, logger_names=(logger_name,), terminal_level="critical"
+        ):
+            try:
+                raise ValueError("kaboom")
+            except ValueError:
+                logging.getLogger(logger_name).exception("operation failed")
+
+        event = events_named(sink.events, "log")[0]
+        self.assertEqual(event["body"], "operation failed")
+        self.assertEqual(event["severity_text"], "ERROR")
+        exception_text = event["attributes"]["exc_info"]
+        self.assertIn("Traceback (most recent call last)", exception_text)
+        self.assertIn("ValueError: kaboom", exception_text)
+
+    def test_httpcore_response_headers_are_mined_and_redacted(self) -> None:
+        sink = InMemoryEventSink()
+
+        with cli_logging_handlers(
+            sink=sink,
+            logger_names=("src_py_lib_test_httpcore",),
+            terminal_level="critical",
+            suppress_http_dependency_logs=False,
+        ):
+            logging.getLogger("httpcore.http11").debug(
+                "receive_response_headers.complete "
+                "return_value=(b'HTTP/1.1', 200, b'OK', "
+                "[(b'Zed', b'last'), (b'Content-Type', b'application/json'), "
+                "(b'Set-Cookie', b'session=secret'), "
+                "(b'X-Api-Key', b'secret'), (b'Alpha', b'first')])"
+            )
+
+        event = events_named(sink.events, "log")[0]
+        self.assertEqual(event["body"], "receive_response_headers.complete")
+        attributes = event["attributes"]
+        self.assertEqual(attributes["logger"], "httpcore.http11")
+        self.assertEqual(attributes["http_version"], "HTTP/1.1")
+        self.assertEqual(attributes["status_code"], 200)
+        self.assertEqual(attributes["reason_phrase"], "OK")
+        self.assertEqual(
+            list(attributes["headers"]),
+            ["alpha", "content-type", "set-cookie", "x-api-key", "zed"],
+        )
+        self.assertEqual(
+            attributes["headers"],
+            {
+                "alpha": "first",
+                "content-type": "application/json",
+                "set-cookie": "[redacted]",
+                "x-api-key": "[redacted]",
+                "zed": "last",
+            },
+        )
+
+    def test_httpx_request_logs_are_demoted_to_debug_severity(self) -> None:
+        sink = InMemoryEventSink()
+
+        with cli_logging_handlers(
+            sink=sink,
+            logger_names=("src_py_lib_test_httpx",),
+            terminal_level="critical",
+            suppress_http_dependency_logs=False,
+        ):
+            logging.getLogger("httpx").info(
+                'HTTP Request: POST https://api.linear.app/graphql "HTTP/1.1 200 OK"'
+            )
+
+        event = next(
+            event
+            for event in events_named(sink.events, "log")
+            if str(event["body"]).startswith("HTTP Request:")
+        )
+        self.assertEqual(event["severity_text"], "DEBUG")
+        self.assertEqual(event["severity_number"], 5)
+
+    def test_http_dependency_logs_are_suppressed_by_default(self) -> None:
+        sink = InMemoryEventSink()
+        httpx_logger = logging.getLogger("httpx")
+        httpx_handlers_before = list(httpx_logger.handlers)
+
+        with cli_logging_handlers(
+            sink=sink, logger_names=("src_py_lib_test_suppressed",), terminal_level="critical"
+        ):
+            self.assertEqual(list(httpx_logger.handlers), httpx_handlers_before)
+            httpx_logger.info('HTTP Request: GET https://example.com "HTTP/1.1 200 OK"')
+            logging.getLogger("httpcore.http11").debug(
+                "receive_response_headers.complete return_value=()"
+            )
+
+        self.assertEqual(sink.events, [])
+
+
+class CliRunContextTest(unittest.TestCase):
+    def test_cli_run_context_writes_jsonl_run_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
-            logger_name = "src_py_lib_test_quiet_event"
-            configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
+            config = ExampleConfig(token="secret-token")
+
+            with src.logging(
+                config,
+                command="unit-test",
+                git_cwd=__file__,
+                logging_config=LoggingSettings(
                     terminal_level="critical",
-                    log_file_level="info",
+                    log_file_level="debug",
                     log_file=log_file,
                     run="test-run",
-                )
-            )
-            try:
-                with span(
-                    "quiet_start",
-                    logger_name=logger_name,
-                    level="info",
-                    start_level="debug",
-                    omit_success_status=True,
-                ):
-                    pass
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+                ),
+            ) as context_log_file:
+                self.assertEqual(context_log_file, log_file)
+                info("inside_command", answer=42)
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            quiet_rows = [row for row in rows if row["event"] == "quiet_start"]
-            self.assertEqual(len(quiet_rows), 1)
-            self.assertEqual(quiet_rows[0]["phase"], "end")
-            self.assertNotIn("status", quiet_rows[0])
-            self.assertNotIn("error_type", quiet_rows[0])
+            rows = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
 
-    def test_logging_context_emits_run_summary_resource_and_http_metrics(self) -> None:
+            writing = events_named(rows, "log")[0]
+            self.assertEqual(writing["body"], f"Writing log events to {log_file}.")
+
+            run_start = phase_event(rows, "run", "start")
+            self.assertEqual(run_start["severity_text"], "DEBUG")
+            self.assertIn("process.pid", run_start["resource"])
+
+            startup = events_named(rows, "startup")[0]
+            self.assertEqual(startup["severity_text"], "INFO")
+            self.assertEqual(startup["attributes"]["command"], "unit-test")
+            self.assertEqual(startup["attributes"]["log_file"], str(log_file))
+            self.assertEqual(startup["attributes"]["config"]["EXAMPLE_TOKEN"], "provided")
+            self.assertIn("git_commit", startup["attributes"])
+
+            inside = events_named(rows, "inside_command")[0]
+            self.assertEqual(inside["attributes"]["command"], "unit-test")
+            self.assertEqual(inside["attributes"]["run"], "test-run")
+            self.assertEqual(inside["attributes"]["answer"], 42)
+
+            run_end = phase_event(rows, "run", "end")
+            self.assertEqual(run_end["severity_text"], "INFO")
+            self.assertEqual(run_end["attributes"]["status"], "ok")
+
+            for row in rows:
+                self.assertLessEqual(set(row), set(EVENT_FIELD_ORDER))
+                model_keys = [key for key in row if key in EVENT_FIELD_ORDER]
+                self.assertEqual(model_keys, [key for key in EVENT_FIELD_ORDER if key in row])
+                self.assertEqual(list(row["attributes"]), sorted(row["attributes"]))
+
+    def test_cli_run_context_emits_run_summary_and_resets_http_metrics(self) -> None:
         attempts = 0
 
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -1191,162 +1521,178 @@ class LoggingTest(unittest.TestCase):
             return httpx.Response(200, json={"ok": True})
 
         with tempfile.TemporaryDirectory() as directory:
+            first_log_file = Path(directory) / "first.json"
+            second_log_file = Path(directory) / "second.json"
+
+            with src.logging(
+                command="unit-test",
+                logging_config=LoggingSettings(
+                    terminal_level="critical",
+                    log_file_level="debug",
+                    log_file=first_log_file,
+                    run="test-run",
+                    resource_sample_interval_seconds=0,
+                ),
+                run_fields={"endpoint": "https://example.com"},
+                run_summary=lambda: {"custom_count": 7},
+            ):
+                client = HTTPClient(
+                    max_attempts=2,
+                    retry_base_delay_seconds=0,
+                    retry_max_delay_seconds=0,
+                    transport=httpx.MockTransport(handler),
+                )
+                self.assertEqual(
+                    client.json(
+                        "POST",
+                        "https://example.com/api",
+                        json_body={"hello": "world"},
+                    ),
+                    {"ok": True},
+                )
+
+            rows = [
+                json.loads(line) for line in first_log_file.read_text(encoding="utf-8").splitlines()
+            ]
+            run_end = phase_event(rows, "run", "end")
+            attributes = run_end["attributes"]
+            self.assertEqual(attributes["status"], "ok")
+            self.assertEqual(attributes["exit_code"], 0)
+            self.assertEqual(attributes["endpoint"], "https://example.com")
+            self.assertEqual(attributes["custom_count"], 7)
+            self.assertEqual(attributes["http.client.request.count"], 2)
+            self.assertEqual(attributes["http.client.retry.count"], 1)
+            self.assertEqual(attributes["http.client.response.2xx.count"], 1)
+            self.assertEqual(attributes["http.client.response.4xx.count"], 1)
+            self.assertEqual(attributes["http.client.response.429.count"], 1)
+            self.assertEqual(attributes["http.client.transport_error.count"], 0)
+            self.assertGreater(attributes["http.client.request.body.size.total"], 0)
+            self.assertGreater(attributes["http.client.response.body.size.total"], 0)
+            self.assertIn("cpu_count_logical", attributes)
+            self.assertIn("peak_rss_mb", attributes)
+
+            with src.logging(
+                command="unit-test",
+                logging_config=LoggingSettings(
+                    terminal_level="critical",
+                    log_file_level="debug",
+                    log_file=second_log_file,
+                    run="test-run-2",
+                ),
+            ):
+                pass
+
+            second_rows = [
+                json.loads(line)
+                for line in second_log_file.read_text(encoding="utf-8").splitlines()
+            ]
+            second_run_end = phase_event(second_rows, "run", "end")
+            self.assertEqual(second_run_end["attributes"]["http.client.request.count"], 0)
+            self.assertEqual(second_run_end["attributes"]["http.client.retry.count"], 0)
+
+    def test_cli_run_context_records_system_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
-            try:
-                with src.logging(
+
+            with (
+                self.assertRaises(SystemExit),
+                src.logging(
                     command="unit-test",
                     logging_config=LoggingSettings(
+                        logger_names=("src_py_lib_test_exit_code",),
                         terminal_level="critical",
                         log_file_level="debug",
                         log_file=log_file,
                         run="test-run",
-                        resource_sample_interval_seconds=0,
                     ),
-                    run_fields={"endpoint": "https://example.com"},
-                    run_summary=lambda: {"custom_count": 7},
-                ):
-                    client = HTTPClient(
-                        max_attempts=2,
-                        retry_base_delay_seconds=0,
-                        retry_max_delay_seconds=0,
-                        transport=httpx.MockTransport(handler),
-                    )
-                    self.assertEqual(
-                        client.json(
-                            "POST",
-                            "https://example.com/api",
-                            json_body={"hello": "world"},
-                        ),
-                        {"ok": True},
-                    )
-            finally:
-                logger = logging.getLogger("")
-                for handler_ in list(logger.handlers):
-                    logger.removeHandler(handler_)
-                    handler_.close()
+                ),
+            ):
+                raise SystemExit(3)
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            run_end = next(row for row in rows if row["event"] == "run" and row["phase"] == "end")
-            self.assertEqual(run_end["status"], "ok")
-            self.assertEqual(run_end["exit_code"], 0)
-            self.assertEqual(run_end["endpoint"], "https://example.com")
-            self.assertEqual(run_end["custom_count"], 7)
-            self.assertEqual(run_end["http_request_attempt_count"], 2)
-            self.assertEqual(run_end["http_retry_count"], 1)
-            self.assertEqual(run_end["http_2xx_count"], 1)
-            self.assertEqual(run_end["http_429_count"], 1)
-            self.assertGreater(run_end["http_request_bytes_total"], 0)
-            self.assertGreater(run_end["http_response_bytes_total"], 0)
-            self.assertIn("cpu_count_logical", run_end)
+            rows = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+            run_end = phase_event(rows, "run", "end")
+            self.assertEqual(run_end["severity_text"], "ERROR")
+            self.assertEqual(run_end["attributes"]["status"], "error")
+            self.assertEqual(run_end["attributes"]["error.type"], "SystemExit")
+            self.assertEqual(run_end["attributes"]["exit_code"], 3)
 
-    def test_logging_context_records_system_exit_code(self) -> None:
+    def test_src_log_level_env_controls_log_file_level(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_file = Path(directory) / "events.json"
-            try:
-                with (
-                    self.assertRaises(SystemExit),
-                    src.logging(
-                        command="unit-test",
-                        logging_config=LoggingSettings(
-                            terminal_level="critical",
-                            log_file_level="debug",
-                            log_file=log_file,
-                            run="test-run",
-                        ),
+
+            with (
+                patch.dict("os.environ", {"SRC_LOG_LEVEL": "INFO"}),
+                src.logging(
+                    command="unit-test",
+                    logging_config=LoggingSettings(
+                        logger_names=("src_py_lib_test_log_level",),
+                        terminal_level="critical",
+                        log_file=log_file,
+                        run="test-run",
                     ),
-                ):
-                    raise SystemExit(3)
-            finally:
-                logger = logging.getLogger("")
-                for handler_ in list(logger.handlers):
-                    logger.removeHandler(handler_)
-                    handler_.close()
+                ),
+            ):
+                debug("debug_event")
+                info("info_event")
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            run_end = next(row for row in rows if row["event"] == "run" and row["phase"] == "end")
-            self.assertEqual(run_end["status"], "error")
-            self.assertEqual(run_end["error_type"], "SystemExit")
-            self.assertEqual(run_end["exit_code"], 3)
+            rows = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+            names = [row["event_name"] for row in rows]
+            self.assertNotIn("debug_event", names)
+            self.assertIn("info_event", names)
 
-    def test_httpx_request_logs_are_debug_events(self) -> None:
+    def test_cli_run_context_defaults_log_file_under_logs_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "httpx"
-            configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
+            logs_dir = Path(directory) / "logs"
+
+            with src.logging(
+                command="unit-test",
+                logging_config=LoggingSettings(
+                    logger_names=("src_py_lib_test_default_logs_dir",),
                     terminal_level="critical",
                     log_file_level="debug",
-                    log_file=log_file,
+                    logs_dir=logs_dir,
                     run="test-run",
-                )
-            )
-            try:
-                logging.getLogger(logger_name).info(
-                    'HTTP Request: POST https://api.linear.app/graphql "HTTP/1.1 200 OK"'
-                )
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+                ),
+            ) as log_file:
+                info("default_log_path")
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            request_log = next(
-                row for row in rows if row.get("message", "").startswith("HTTP Request:")
+            if log_file is None:
+                self.fail("cli_run_context did not yield a default log file")
+            self.assertEqual(log_file.parent, logs_dir)
+            self.assertRegex(
+                log_file.name,
+                r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{4}-test-run\.json$",
             )
-            self.assertEqual(request_log["level"], "DEBUG")
+            rows = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(events_named(rows, "default_log_path")), 1)
 
-    def test_httpcore_response_headers_are_structured(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            logger_name = "httpcore"
-            configure_logging(
-                LoggingSettings(
-                    logger_name=logger_name,
-                    terminal_level="info",
-                    log_file_level="debug",
-                    log_file=log_file,
-                    run="test-run",
-                )
-            )
-            try:
-                logging.getLogger("httpcore.http11").debug(
-                    "receive_response_headers.complete "
-                    "return_value=(b'HTTP/1.1', 200, b'OK', "
-                    "[(b'Zed', b'last'), (b'Content-Type', b'application/json'), "
-                    "(b'Set-Cookie', b'session=secret'), "
-                    "(b'X-Api-Key', b'secret'), (b'Alpha', b'first')])"
-                )
-            finally:
-                logger = logging.getLogger(logger_name)
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            response_headers = next(
-                row for row in rows if row.get("message") == "receive_response_headers.complete"
-            )
+class OtelLogsSinkTest(unittest.TestCase):
+    def test_otel_logs_sink_round_trips_events_through_logs_api(self) -> None:
+        exporter = InMemoryLogRecordExporter()
+        provider = LoggerProvider()
+        provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+        set_logger_provider(provider)
+        sink = OtelLogsSink()
 
-            self.assertEqual(response_headers["logger"], "httpcore.http11")
-            self.assertEqual(response_headers["http_version"], "HTTP/1.1")
-            self.assertEqual(response_headers["status_code"], 200)
-            self.assertEqual(response_headers["reason_phrase"], "OK")
-            self.assertEqual(
-                list(response_headers["headers"]),
-                ["alpha", "content-type", "set-cookie", "x-api-key", "zed"],
-            )
-            self.assertEqual(
-                response_headers["headers"],
-                {
-                    "alpha": "first",
-                    "content-type": "application/json",
-                    "set-cookie": "[redacted]",
-                    "x-api-key": "[redacted]",
-                    "zed": "last",
-                },
-            )
+        sink.emit(
+            {
+                "time_unix_nano": 123,
+                "severity_text": "INFO",
+                "severity_number": 9,
+                "event_name": "unit_test_event",
+                "body": "hello",
+                "attributes": {"answer": 42},
+            }
+        )
+
+        records = exporter.get_finished_logs()
+        self.assertEqual(len(records), 1)
+        record = records[0].log_record
+        self.assertEqual(record.severity_text, "INFO")
+        self.assertEqual(record.body, "hello")
+        self.assertEqual(record.event_name, "unit_test_event")
+        self.assertEqual(dict(record.attributes or {}), {"answer": 42})
 
 
 class HTTPClientTest(unittest.TestCase):
@@ -1409,55 +1755,38 @@ class HTTPClientTest(unittest.TestCase):
                 },
             )
 
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            configure_logging(
-                LoggingSettings(
-                    terminal_level="critical",
-                    log_file_level="debug",
-                    log_file=log_file,
-                    run="test-run",
-                )
-            )
-            try:
-                client = HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler))
-                payload = client.json(
-                    "POST",
-                    "https://user:pass@example.com/api?code=oauth",
-                    headers={"Authorization": "Bearer token"},
-                    query={"limit": 10, "access_token": "secret", "signature": "signed"},
-                    json_body={"hello": "world"},
-                )
-            finally:
-                logger = logging.getLogger("")
-                for handler_ in list(logger.handlers):
-                    logger.removeHandler(handler_)
-                    handler_.close()
-
-            self.assertEqual(payload, {"ok": True})
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            http_request = next(
-                row
-                for row in rows
-                if row.get("event") == "http_request" and row.get("phase") == "end"
+        sink = InMemoryEventSink()
+        with observability_context("unit-test", sink=sink, run="test-run", min_level="debug"):
+            client = HTTPClient(max_attempts=1, transport=httpx.MockTransport(handler))
+            payload = client.json(
+                "POST",
+                "https://user:pass@example.com/api?code=oauth",
+                headers={"Authorization": "Bearer token"},
+                query={"limit": 10, "access_token": "secret", "signature": "signed"},
+                json_body={"hello": "world"},
             )
 
-            self.assertFalse(any(row.get("logger") in {"httpx", "httpcore"} for row in rows))
-            self.assertEqual(http_request["status_code"], 200)
-            self.assertEqual(http_request["reason_phrase"], "OK")
-            self.assertEqual(
-                http_request["url"],
-                "https://example.com/api?code=[redacted]&limit=10"
-                "&access_token=[redacted]&signature=[redacted]",
-            )
-            self.assertEqual(http_request["request_bytes"], len(b'{"hello": "world"}'))
-            self.assertEqual(http_request["request_headers"]["authorization"], "[redacted]")
-            self.assertEqual(
-                list(http_request["response_headers"]), sorted(http_request["response_headers"])
-            )
-            self.assertEqual(http_request["response_headers"]["content-type"], "application/json")
-            self.assertEqual(http_request["response_headers"]["set-cookie"], "[redacted]")
-            self.assertEqual(http_request["response_headers"]["zed"], "last")
+        self.assertEqual(payload, {"ok": True})
+        http_request = phase_event(sink.events, "http_request", "end")
+        attributes = http_request["attributes"]
+
+        self.assertEqual(http_request["severity_text"], "DEBUG")
+        self.assertEqual(events_named(sink.events, "log"), [])
+        self.assertEqual(attributes["status_code"], 200)
+        self.assertEqual(attributes["reason_phrase"], "OK")
+        self.assertEqual(
+            attributes["url"],
+            "https://example.com/api?code=[redacted]&limit=10"
+            "&access_token=[redacted]&signature=[redacted]",
+        )
+        self.assertEqual(attributes["request_bytes"], len(b'{"hello": "world"}'))
+        self.assertEqual(attributes["request_headers"]["authorization"], "[redacted]")
+        self.assertEqual(
+            list(attributes["response_headers"]), sorted(attributes["response_headers"])
+        )
+        self.assertEqual(attributes["response_headers"]["content-type"], "application/json")
+        self.assertEqual(attributes["response_headers"]["set-cookie"], "[redacted]")
+        self.assertEqual(attributes["response_headers"]["zed"], "last")
 
     def test_json_request_wraps_timeouts(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -1948,47 +2277,30 @@ query Items($first: Int!, $after: String, $userId: ID!) {
 }
 """
 
-        with tempfile.TemporaryDirectory() as directory:
-            log_file = Path(directory) / "events.json"
-            configure_logging(
-                LoggingSettings(
-                    terminal_level="critical",
-                    log_file_level="debug",
-                    log_file=log_file,
-                    run="test-run",
-                )
-            )
-            try:
-                client.execute(query, variables={"userId": "u1"}, page_size=2)
-            finally:
-                logger = logging.getLogger("")
-                for handler in list(logger.handlers):
-                    logger.removeHandler(handler)
-                    handler.close()
+        sink = InMemoryEventSink()
+        with observability_context("unit-test", sink=sink, run="test-run", min_level="debug"):
+            client.execute(query, variables={"userId": "u1"}, page_size=2)
 
-            rows = [json.loads(line) for line in log_file.read_text().splitlines()]
-            starts = [
-                row
-                for row in rows
-                if row.get("event") == "graphql_query" and row.get("phase") == "start"
-            ]
-            ends = [
-                row
-                for row in rows
-                if row.get("event") == "graphql_query" and row.get("phase") == "end"
-            ]
+        query_events = events_named(sink.events, "graphql_query")
+        starts = [
+            event["attributes"] for event in query_events if event["attributes"]["phase"] == "start"
+        ]
+        ends = [
+            event["attributes"] for event in query_events if event["attributes"]["phase"] == "end"
+        ]
 
-            self.assertEqual([row["query_name"] for row in starts], ["Items", "Items"])
-            self.assertEqual([row["page_number"] for row in starts], [1, 2])
-            self.assertEqual([row["page_size"] for row in starts], [2, 2])
-            self.assertEqual([row["cursor_present"] for row in starts], [False, True])
-            self.assertEqual(starts[0]["graphql_client"], "Example")
-            self.assertEqual(
-                starts[0]["url"],
-                "https://example.com/graphql?access_token=[redacted]&query=ok",
-            )
-            self.assertEqual(starts[0]["variable_names"], ["after", "first", "userId"])
-            self.assertEqual(ends[0]["response_fields"], ["viewer"])
+        self.assertTrue(all(event["severity_text"] == "DEBUG" for event in query_events))
+        self.assertEqual([attributes["query_name"] for attributes in starts], ["Items", "Items"])
+        self.assertEqual([attributes["page_number"] for attributes in starts], [1, 2])
+        self.assertEqual([attributes["page_size"] for attributes in starts], [2, 2])
+        self.assertEqual([attributes["cursor_present"] for attributes in starts], [False, True])
+        self.assertEqual(starts[0]["graphql_client"], "Example")
+        self.assertEqual(
+            starts[0]["url"],
+            "https://example.com/graphql?access_token=[redacted]&query=ok",
+        )
+        self.assertEqual(starts[0]["variable_names"], ["after", "first", "userId"])
+        self.assertEqual(ends[0]["response_fields"], ["viewer"])
 
     def test_graphql_client_requires_end_cursor_for_next_page(self) -> None:
         http = RecordingHTTP(

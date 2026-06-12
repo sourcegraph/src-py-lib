@@ -1,8 +1,17 @@
-"""Central structured logging for small CLIs and scripts.
+"""Central structured logging and observability for CLIs and importable libraries.
 
-Use `configure_logging()` once near process startup. Other modules should use
-`logging.getLogger(__name__)` for human-readable operator messages and
-`span()` / `log_event()` for structured JSONL events.
+Three decoupled channels:
+
+- Human messages: plain `logging.getLogger(__name__)` on module loggers.
+  Library code never installs handlers; CLI entrypoints opt in via
+  `cli_logging_handlers()` (or the composed `cli_run_context()`).
+- Structured wide events: `span()` / `log_event()` emit OTel-shaped dicts to
+  the active `EventSink` (see `events.py`). Outside a run context the sink is
+  null, so importing this library never writes anywhere.
+- OpenTelemetry traces: opened by `span()` whenever a provider is configured.
+
+`observability_context()` owns one run: event runtime, optional OTel setup,
+run start/end events, resource sampling, and flush ordering.
 """
 
 from __future__ import annotations
@@ -11,7 +20,6 @@ import ast
 import contextlib
 import contextvars
 import datetime as _datetime
-import json
 import logging
 import os
 import secrets
@@ -19,7 +27,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +38,7 @@ if sys.platform != "win32":
 
 from pydantic import model_validator
 
-from src_py_lib.utils import telemetry
+from src_py_lib.utils import events, telemetry
 from src_py_lib.utils.config import Config, config_field, config_snapshot
 
 RUN: Final[str] = secrets.token_hex(4)
@@ -52,26 +60,11 @@ SECRET_FIELD_FRAGMENTS: Final[tuple[str, ...]] = (
     "secret",
     "token",
 )
-LOG_FIELD_ORDER: Final[tuple[str, ...]] = (
-    "ts",
-    "command",
-    "level",
-    "run",
-    "trace",
-    "span",
-    "parent_span",
-    "logger",
-    "event",
-    "phase",
-    "stage",
-    "message",
-)
+DEFAULT_LOGGER_NAMES: Final[tuple[str, ...]] = ("src_py_lib",)
 
-_STRUCTURED_EVENT_ATTR: Final[str] = "_src_py_lib_structured_event"
-_STRUCTURED_FIELDS_ATTR: Final[str] = "_src_py_lib_structured_fields"
 _HTTPCORE_RESPONSE_HEADERS_PREFIX: Final[str] = "receive_response_headers.complete return_value="
 _HTTPX_REQUEST_PREFIX: Final[str] = "HTTP Request: "
-_HTTP_DEPENDENCY_LOGGER_PREFIXES: Final[tuple[str, ...]] = ("httpx", "httpcore")
+_HTTP_DEPENDENCY_LOGGER_NAMES: Final[tuple[str, ...]] = ("httpx", "httpcore")
 _CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("src_py_lib_log_context")
 _PARENT_SPAN_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "src_py_lib_parent_span_id", default=None
@@ -80,9 +73,9 @@ _PARENT_SPAN_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVa
 
 @dataclass(frozen=True)
 class LoggingSettings:
-    """Logging destinations and levels."""
+    """Logging destinations and levels for one CLI run."""
 
-    logger_name: str = ""
+    logger_names: tuple[str, ...] = DEFAULT_LOGGER_NAMES
     terminal_level: str = "info"
     log_file_level: str | None = None
     log_file: Path | None = None
@@ -174,7 +167,7 @@ def logging_settings_from_config(
     *,
     terminal_default: str = "INFO",
     log_file_default: str | None = DEFAULT_LOG_FILE_LEVEL,
-    logger_name: str = "",
+    logger_names: tuple[str, ...] = DEFAULT_LOGGER_NAMES,
     log_file: Path | None = None,
     logs_dir: Path | None = DEFAULT_LOGS_DIR,
     run: str = RUN,
@@ -186,7 +179,7 @@ def logging_settings_from_config(
     """Return `LoggingSettings` using common CLI log-level alias."""
     explicit_level = resolve_log_level_name(config)
     return LoggingSettings(
-        logger_name=logger_name,
+        logger_names=logger_names,
         terminal_level=explicit_level or terminal_default,
         log_file_level=explicit_level or log_file_default,
         log_file=log_file,
@@ -201,16 +194,16 @@ def logging_settings_from_config(
 
 _HTTP_METRICS_LOCK: Final[threading.Lock] = threading.Lock()
 _HTTP_METRICS: dict[str, int] = {
-    "http_request_attempt_count": 0,
-    "http_request_bytes_total": 0,
-    "http_response_bytes_total": 0,
-    "http_retry_count": 0,
-    "http_2xx_count": 0,
-    "http_3xx_count": 0,
-    "http_4xx_count": 0,
-    "http_429_count": 0,
-    "http_5xx_count": 0,
-    "http_transport_error_count": 0,
+    "http.client.request.count": 0,
+    "http.client.request.body.size.total": 0,
+    "http.client.response.body.size.total": 0,
+    "http.client.retry.count": 0,
+    "http.client.response.2xx.count": 0,
+    "http.client.response.3xx.count": 0,
+    "http.client.response.4xx.count": 0,
+    "http.client.response.429.count": 0,
+    "http.client.response.5xx.count": 0,
+    "http.client.transport_error.count": 0,
 }
 
 
@@ -312,116 +305,121 @@ class ResourceSampler:
         return fields
 
 
-class _DropStructuredEvents(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not hasattr(record, _STRUCTURED_EVENT_ATTR)
+def _event_payload(
+    numeric_level: int,
+    event_name: str,
+    *,
+    attributes: dict[str, Any],
+    body: str | None = None,
+) -> dict[str, Any]:
+    """Build one OTel-shaped wide event payload."""
+    severity_text, severity_number = events.severity_fields(numeric_level)
+    runtime = events.current_event_runtime()
+    if runtime.run:
+        attributes.setdefault("run", runtime.run)
+    resource = attributes.pop(events.RESOURCE, None)
+    payload: dict[str, Any] = {
+        events.TIME_UNIX_NANO: time.time_ns(),
+        events.SEVERITY_TEXT: severity_text,
+        events.SEVERITY_NUMBER: severity_number,
+        events.EVENT_NAME: event_name,
+        **telemetry.current_trace_fields(_PARENT_SPAN_CONTEXT.get()),
+        events.ATTRIBUTES: attributes,
+    }
+    if resource is not None:
+        payload[events.RESOURCE] = resource
+    if body is not None:
+        payload[events.BODY] = body
+    return payload
 
 
-class _DropHTTPDependencyLogs(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not any(
-            record.name == prefix or record.name.startswith(f"{prefix}.")
-            for prefix in _HTTP_DEPENDENCY_LOGGER_PREFIXES
-        )
+class EventBridgeHandler(logging.Handler):
+    """Forward human log records into the event sink as `event_name="log"` events.
 
+    Carries the httpcore wire-debug mining and secret redaction from
+    `_structured_log_fields()`, plus exception tracebacks via `exc_info`.
+    Installed only by CLI entrypoints; never by library code.
+    """
 
-class JSONLogFileHandler(logging.Handler):
-    """Write every log record as one JSON object line."""
-
-    def __init__(self, path: Path, *, run: str, level: int) -> None:
-        super().__init__(level=level)
-        self.path = path
-        self._run = run
-        self._lock = threading.Lock()
-        self._file = path.open("w", encoding="utf-8", buffering=1)
+    def __init__(self, sink: events.EventSink, *, level: int | str = DEFAULT_LOG_FILE_LEVEL):
+        super().__init__(level=_log_level(level))
+        self.sink = sink
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            timestamp = _datetime.datetime.now(_datetime.UTC).isoformat(timespec="milliseconds")
-            structured_event = getattr(record, _STRUCTURED_EVENT_ATTR, None)
-            if isinstance(structured_event, str):
-                fields = getattr(record, _STRUCTURED_FIELDS_ATTR, {})
-                structured_fields: dict[str, Any] = (
-                    dict(cast(Mapping[str, Any], fields)) if isinstance(fields, Mapping) else {}
-                )
-                payload = {
-                    "ts": timestamp,
-                    "run": self._run,
-                    "level": record.levelname,
-                    "event": structured_event,
-                    **structured_fields,
-                }
-            else:
-                message, log_fields = _structured_log_fields(record)
-                payload = {
-                    "ts": timestamp,
-                    "run": self._run,
-                    "level": record.levelname,
-                    "event": "log",
-                    "logger": record.name,
-                    "message": message,
-                }
-                payload.update(log_fields)
-                payload.update(_current_log_fields(payload))
-                if record.exc_info:
-                    payload["exc_info"] = self.format(record)
-            with self._lock:
-                self._file.write(json.dumps(_ordered_payload(payload), default=str) + "\n")
+            message, mined_fields = _structured_log_fields(record)
+            numeric_level = record.levelno
+            mined_level = mined_fields.pop("level", None)
+            if isinstance(mined_level, str):
+                numeric_level = _log_level(mined_level)
+            attributes: dict[str, Any] = {
+                **_CONTEXT.get({}),
+                "logger": record.name,
+                **mined_fields,
+            }
+            if record.exc_info:
+                attributes["exc_info"] = self.format(record)
+            self.sink.emit(
+                _event_payload(numeric_level, "log", attributes=attributes, body=message)
+            )
         except Exception:
             self.handleError(record)
 
-    def close(self) -> None:
-        with contextlib.suppress(Exception), self._lock:
-            self._file.flush()
-            self._file.close()
-        super().close()
 
+@contextlib.contextmanager
+def cli_logging_handlers(
+    *,
+    sink: events.EventSink | None = None,
+    logger_names: Sequence[str] = DEFAULT_LOGGER_NAMES,
+    terminal_level: int | str = "info",
+    bridge_level: int | str = DEFAULT_LOG_FILE_LEVEL,
+    suppress_http_dependency_logs: bool = True,
+) -> Generator[None]:
+    """Attach terminal (and optional bridge) handlers to the named loggers.
 
-def configure_logging(config: LoggingSettings | None = None) -> Path | None:
-    """Configure terminal logging and optional JSON log-file logging.
+    Adds and removes only its own handlers, restores prior logger levels on
+    exit, and never touches the root logger or other handlers — safe to
+    compose with a host application's logging configuration.
 
-    Returns the JSON log-file path when file logging is enabled.
+    With `suppress_http_dependency_logs=False`, httpx/httpcore loggers are
+    bridged too, restoring wire-level debugging in the event stream.
     """
-    config = config or LoggingSettings()
-    reset_observability_metrics()
-    terminal_level = _log_level(config.terminal_level)
-    log_file_level = _log_file_level(config.log_file_level)
-    log_file = config.log_file
-    if log_file is None and config.logs_dir is not None:
-        log_file = default_log_file(config.logs_dir, run=config.run)
-    root_or_package_logger = logging.getLogger(config.logger_name)
-    root_or_package_logger.handlers.clear()
-    root_or_package_logger.setLevel(
-        min(
-            terminal_level,
-            log_file_level if log_file else terminal_level,
-        )
+    resolved_terminal_level = _log_level(terminal_level)
+    resolved_bridge_level = _log_level(bridge_level)
+    handler_level = (
+        min(resolved_terminal_level, resolved_bridge_level)
+        if sink is not None
+        else resolved_terminal_level
     )
-    root_or_package_logger.propagate = False
 
     terminal_handler = logging.StreamHandler()
-    terminal_handler.setLevel(terminal_level)
+    terminal_handler.setLevel(resolved_terminal_level)
     terminal_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    terminal_handler.addFilter(_DropStructuredEvents())
-    if config.suppress_http_dependency_logs and config.logger_name == "":
-        terminal_handler.addFilter(_DropHTTPDependencyLogs())
-    root_or_package_logger.addHandler(terminal_handler)
+    bridge_handler = EventBridgeHandler(sink, level=resolved_bridge_level) if sink else None
 
-    if log_file is None:
-        return None
-
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    _prune_old_log_files(log_file.parent, config.retain_log_files)
-    log_file_handler = JSONLogFileHandler(
-        log_file,
-        run=config.run,
-        level=log_file_level,
-    )
-    if config.suppress_http_dependency_logs and config.logger_name == "":
-        log_file_handler.addFilter(_DropHTTPDependencyLogs())
-    root_or_package_logger.addHandler(log_file_handler)
-    root_or_package_logger.info("Writing log events to %s.", log_file)
-    return log_file
+    names = tuple(logger_names)
+    if not suppress_http_dependency_logs:
+        names += _HTTP_DEPENDENCY_LOGGER_NAMES
+    previous_levels: dict[str, int] = {}
+    attached: list[tuple[logging.Logger, logging.Handler]] = []
+    try:
+        for name in names:
+            logger = logging.getLogger(name)
+            previous_levels[name] = logger.level
+            if logger.level == logging.NOTSET or logger.level > handler_level:
+                logger.setLevel(handler_level)
+            if name not in _HTTP_DEPENDENCY_LOGGER_NAMES:
+                logger.addHandler(terminal_handler)
+                attached.append((logger, terminal_handler))
+            if bridge_handler is not None:
+                logger.addHandler(bridge_handler)
+                attached.append((logger, bridge_handler))
+        yield
+    finally:
+        for logger, handler in attached:
+            logger.removeHandler(handler)
+        for name, level in previous_levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 def reset_observability_metrics() -> None:
@@ -440,30 +438,30 @@ def record_http_attempt(
 ) -> None:
     """Record one HTTP attempt for the current run summary."""
     with _HTTP_METRICS_LOCK:
-        _HTTP_METRICS["http_request_attempt_count"] += 1
-        _HTTP_METRICS["http_request_bytes_total"] += request_bytes
-        _HTTP_METRICS["http_response_bytes_total"] += response_bytes
+        _HTTP_METRICS["http.client.request.count"] += 1
+        _HTTP_METRICS["http.client.request.body.size.total"] += request_bytes
+        _HTTP_METRICS["http.client.response.body.size.total"] += response_bytes
         if transport_error:
-            _HTTP_METRICS["http_transport_error_count"] += 1
+            _HTTP_METRICS["http.client.transport_error.count"] += 1
         if status_code is None:
             return
         status_group = 5 if status_code >= 500 else status_code // 100
         metric_name = {
-            2: "http_2xx_count",
-            3: "http_3xx_count",
-            4: "http_4xx_count",
-            5: "http_5xx_count",
+            2: "http.client.response.2xx.count",
+            3: "http.client.response.3xx.count",
+            4: "http.client.response.4xx.count",
+            5: "http.client.response.5xx.count",
         }.get(status_group)
         if metric_name is not None:
             _HTTP_METRICS[metric_name] += 1
         if status_code == 429:
-            _HTTP_METRICS["http_429_count"] += 1
+            _HTTP_METRICS["http.client.response.429.count"] += 1
 
 
 def record_http_retry() -> None:
     """Record that an HTTP attempt will be retried."""
     with _HTTP_METRICS_LOCK:
-        _HTTP_METRICS["http_retry_count"] += 1
+        _HTTP_METRICS["http.client.retry.count"] += 1
 
 
 def observability_summary() -> dict[str, Any]:
@@ -472,25 +470,56 @@ def observability_summary() -> dict[str, Any]:
         return dict(_HTTP_METRICS)
 
 
+def _run_resource_fields(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return OTel resource attributes stamped once on the run-start event."""
+    fields: dict[str, Any] = {
+        events.PROCESS_PID: os.getpid(),
+        events.PROCESS_RUNTIME_NAME: sys.implementation.name,
+        events.PROCESS_RUNTIME_VERSION: sys.version.split()[0],
+    }
+    fields.update(dict(extra or {}))
+    return fields
+
+
 @contextlib.contextmanager
-def logging_context(
+def observability_context(
     name: str,
     config: object | None = None,
     *,
+    sink: events.EventSink | None = None,
+    run: str = RUN,
+    min_level: int | str = DEFAULT_LOG_FILE_LEVEL,
     git_cwd: Path | str | None = None,
-    logging_config: LoggingSettings | None = None,
     run_fields: Mapping[str, Any] | None = None,
     run_summary: Callable[[], Mapping[str, Any]] | None = None,
-) -> Generator[Path | None]:
-    """Configure logging, install command context, and emit startup metadata."""
-    resolved_logging_config = logging_config or LoggingSettings(
-        log_file_level=_src_log_level_from_config(config)
-    )
+    resource: Mapping[str, Any] | None = None,
+    open_telemetry: telemetry.OpenTelemetrySettings | None = None,
+    resource_sample_interval_seconds: float | None = None,
+    log_file: Path | None = None,
+) -> Generator[None]:
+    """Own one run's observability without touching stdlib logging handlers.
+
+    Installs the event runtime (sink, run id, level floor), configures
+    OpenTelemetry only when explicitly requested, emits run start/end and
+    startup events, runs the resource sampler, and tears down in order:
+    sampler -> run-end event -> sink flush -> OTel flush (owned providers
+    only). The run-end event is emitted even on exceptions and `SystemExit`.
+    """
+    reset_observability_metrics()
     open_telemetry_runtime = telemetry.configure_open_telemetry(
-        resolved_logging_config.open_telemetry or telemetry.OpenTelemetrySettings()
+        open_telemetry or telemetry.OpenTelemetrySettings()
     )
-    log_file = configure_logging(resolved_logging_config)
-    sampler = _resource_sampler(resolved_logging_config)
+    runtime = events.EventRuntime(
+        run=run,
+        sink=sink or events.NullEventSink(),
+        min_level=_log_level(min_level),
+    )
+    runtime_token = events.set_event_runtime(runtime)
+    sampler = (
+        ResourceSampler(resource_sample_interval_seconds)
+        if resource_sample_interval_seconds is not None
+        else None
+    )
     started = time.perf_counter()
     error: BaseException | None = None
     try:
@@ -500,17 +529,17 @@ def logging_context(
         ):
             if sampler is not None:
                 sampler.start()
-            start_fields = {"phase": "start", **dict(run_fields or {})}
-            info("run", logger_name=resolved_logging_config.logger_name, **start_fields)
+            start_fields: dict[str, Any] = {"phase": "start", **dict(run_fields or {})}
+            start_fields[events.RESOURCE] = _run_resource_fields(resource)
+            debug("run", **start_fields)
             try:
                 startup_event(
                     command=name,
                     config=config,
                     log_file=log_file,
                     git_cwd=_git_cwd_path(git_cwd),
-                    logger_name=resolved_logging_config.logger_name,
                 )
-                yield log_file
+                yield
             except BaseException as exception:
                 error = exception
                 raise
@@ -523,25 +552,80 @@ def logging_context(
                 summary["exit_code"] = _run_exit_code(error)
                 if run_summary is not None:
                     summary.update(dict(run_summary()))
-                end_fields = {
+                end_fields: dict[str, Any] = {
                     "phase": "end",
                     "duration_ms": round((time.perf_counter() - started) * 1000.0),
                     "status": "error" if error_type else "ok",
-                    "error_type": error_type,
+                    events.ERROR_TYPE: error_type,
                     **dict(run_fields or {}),
                     **summary,
                 }
                 telemetry.set_current_span_attributes(end_fields)
                 if error_type:
                     telemetry.mark_current_span_error(error_type)
-                log_event(
-                    "error" if error_type else "info",
-                    "run",
-                    logger_name=resolved_logging_config.logger_name,
-                    **end_fields,
-                )
+                log_event("error" if error_type else "info", "run", **end_fields)
     finally:
+        if sink is not None:
+            events.flush_sink(sink)
+        events.reset_event_runtime(runtime_token)
         open_telemetry_runtime.force_flush()
+
+
+@contextlib.contextmanager
+def cli_run_context(
+    name: str,
+    config: object | None = None,
+    *,
+    git_cwd: Path | str | None = None,
+    logging_config: LoggingSettings | None = None,
+    run_fields: Mapping[str, Any] | None = None,
+    run_summary: Callable[[], Mapping[str, Any]] | None = None,
+    resource: Mapping[str, Any] | None = None,
+) -> Generator[Path | None]:
+    """Compose CLI-mode logging for one run: JSONL sink + handlers + observability.
+
+    Yields the JSON event-log path (or None when file logging is disabled).
+    Teardown order: run-end event, sink flush, OTel flush, handler removal,
+    sink close.
+    """
+    settings = logging_config or LoggingSettings(log_file_level=_src_log_level_from_config(config))
+    log_file = settings.log_file
+    if log_file is None and settings.logs_dir is not None:
+        log_file = default_log_file(settings.logs_dir, run=settings.run)
+    with contextlib.ExitStack() as stack:
+        sink: events.JSONLEventSink | None = None
+        if log_file is not None:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            _prune_old_log_files(log_file.parent, settings.retain_log_files)
+            sink = stack.enter_context(events.JSONLEventSink(log_file))
+        stack.enter_context(
+            cli_logging_handlers(
+                sink=sink,
+                logger_names=settings.logger_names,
+                terminal_level=settings.terminal_level,
+                bridge_level=_log_file_level(settings.log_file_level),
+                suppress_http_dependency_logs=settings.suppress_http_dependency_logs,
+            )
+        )
+        if log_file is not None:
+            logging.getLogger(__name__).info("Writing log events to %s.", log_file)
+        stack.enter_context(
+            observability_context(
+                name,
+                config,
+                sink=sink,
+                run=settings.run,
+                min_level=_log_file_level(settings.log_file_level),
+                git_cwd=git_cwd,
+                run_fields=run_fields,
+                run_summary=run_summary,
+                resource=resource,
+                open_telemetry=settings.open_telemetry,
+                resource_sample_interval_seconds=settings.resource_sample_interval_seconds,
+                log_file=log_file,
+            )
+        )
+        yield log_file
 
 
 def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Path:
@@ -552,21 +636,19 @@ def default_log_file(logs_dir: Path = DEFAULT_LOGS_DIR, *, run: str = RUN) -> Pa
 
 
 def log_event(level: str, key: str, *, logger_name: str = "", **fields: Any) -> None:
-    """Log one structured event through the configured logger."""
+    """Emit one structured wide event to the active sink and the current span.
+
+    `logger_name` is accepted for signature compatibility; events no longer
+    ride stdlib logging, so it is ignored.
+    """
+    del logger_name
     numeric_level = _log_level(level)
-    logger = logging.getLogger(logger_name)
-    if not logger.isEnabledFor(numeric_level):
-        return
     telemetry.add_span_event(key, {"level": logging.getLevelName(numeric_level), **fields})
-    logger.log(
-        numeric_level,
-        "event=%s",
-        key,
-        extra={
-            _STRUCTURED_EVENT_ATTR: key,
-            _STRUCTURED_FIELDS_ATTR: {**_current_log_fields(), **fields},
-        },
-    )
+    runtime = events.current_event_runtime()
+    if numeric_level < runtime.min_level:
+        return
+    attributes = {**_CONTEXT.get({}), **fields}
+    runtime.sink.emit(_event_payload(numeric_level, key, attributes=attributes))
 
 
 def debug(key: str, *, logger_name: str = "", **fields: Any) -> None:
@@ -621,12 +703,17 @@ def span(
     logger_name: str = "",
     **fields: Any,
 ) -> Generator[dict[str, Any]]:
-    """Open an observed span and emit start/end structured log events."""
+    """Open an observed span; the span-end event is the canonical wide event.
+
+    Attributes accumulated onto the yielded dict during the work ride the end
+    event alongside duration and status. The start event is demoted to debug
+    (wide-event discipline: one informative event per unit of work).
+    """
     parent_span_id = telemetry.current_span_id()
     parent_reset_token = _PARENT_SPAN_CONTEXT.set(parent_span_id)
     try:
         with telemetry.open_telemetry_span(key, fields):
-            log_event(start_level or level, key, logger_name=logger_name, phase="start", **fields)
+            log_event(start_level or "debug", key, logger_name=logger_name, phase="start", **fields)
             started = time.perf_counter()
             extra: dict[str, Any] = {}
             error: BaseException | None = None
@@ -644,11 +731,11 @@ def span(
                 }
                 if error:
                     end_fields["status"] = "error"
-                    end_fields["error_type"] = type(error).__name__
+                    end_fields[events.ERROR_TYPE] = type(error).__name__
                     telemetry.mark_current_span_error(type(error).__name__)
                 elif not omit_success_status:
                     end_fields["status"] = "ok"
-                    end_fields["error_type"] = None
+                    end_fields[events.ERROR_TYPE] = None
                 telemetry.set_current_span_attributes(end_fields)
                 log_event(
                     "error" if error else level,
@@ -698,16 +785,6 @@ def sanitized_config_snapshot(config: object) -> dict[str, Any]:
     return snapshot
 
 
-def _current_log_fields(protected: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    protected_keys = set(protected or {})
-    fields = {key: value for key, value in _CONTEXT.get({}).items() if key not in protected_keys}
-    trace_fields = telemetry.current_trace_fields(_PARENT_SPAN_CONTEXT.get())
-    for key, value in trace_fields.items():
-        if key not in protected_keys:
-            fields[key] = value
-    return fields
-
-
 def startup_event(
     *,
     command: str,
@@ -748,16 +825,6 @@ def git_short_hash(cwd: Path | None = None) -> str | None:
         return None
     commit = result.stdout.strip()
     return commit if result.returncode == 0 and commit else None
-
-
-def _ordered_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    ordered: dict[str, Any] = {}
-    for key in LOG_FIELD_ORDER:
-        if key in payload:
-            ordered[key] = payload[key]
-    for key in sorted(key for key in payload if key not in ordered):
-        ordered[key] = payload[key]
-    return ordered
 
 
 def _log_file_level(configured_level: str | None) -> int:
@@ -879,11 +946,6 @@ def _secret_state(value: object) -> str:
     if value is None or value == "":
         return "missing"
     return "reference" if isinstance(value, str) and value.startswith("op://") else "provided"
-
-
-def _resource_sampler(config: LoggingSettings) -> ResourceSampler | None:
-    interval_seconds = config.resource_sample_interval_seconds
-    return ResourceSampler(interval_seconds) if interval_seconds is not None else None
 
 
 def _run_error_type(exception: BaseException | None) -> str | None:

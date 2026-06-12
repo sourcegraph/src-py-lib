@@ -117,10 +117,11 @@ class OpenTelemetryRuntime:
     exporting: bool
     tracer_provider: object | None = None
     meter_provider: object | None = None
+    logger_provider: object | None = None
 
     def force_flush(self, timeout_millis: int = 30_000) -> None:
         """Flush configured providers if they expose a force_flush method."""
-        for provider in (self.tracer_provider, self.meter_provider):
+        for provider in (self.tracer_provider, self.meter_provider, self.logger_provider):
             force_flush = getattr(provider, "force_flush", None)
             if callable(force_flush):
                 force_flush(timeout_millis=timeout_millis)
@@ -170,11 +171,13 @@ def configure_open_telemetry(settings: OpenTelemetrySettings) -> OpenTelemetryRu
     resource = _resource(settings)
     tracer_provider = _configure_traces(settings, resource)
     meter_provider = _configure_metrics(settings, resource)
+    logger_provider = _configure_logs(settings, resource) if settings.enabled else None
     return OpenTelemetryRuntime(
         configured=True,
         exporting=settings.enabled,
         tracer_provider=tracer_provider,
         meter_provider=meter_provider,
+        logger_provider=logger_provider,
     )
 
 
@@ -217,16 +220,16 @@ def open_telemetry_span(name: str, fields: Mapping[str, object] | None = None) -
 
 
 def current_trace_fields(parent_span_id: str | None = None) -> dict[str, str]:
-    """Return log-friendly trace/span identifiers for the active span."""
+    """Return OTel-named trace/span identifiers for the active span."""
     span_context = trace.get_current_span().get_span_context()
     if not span_context.is_valid:
         return {}
     fields = {
-        "trace": format_trace_id(span_context.trace_id),
-        "span": format_span_id(span_context.span_id),
+        "trace_id": format_trace_id(span_context.trace_id),
+        "span_id": format_span_id(span_context.span_id),
     }
     if parent_span_id:
-        fields["parent_span"] = parent_span_id
+        fields["parent_span_id"] = parent_span_id
     return fields
 
 
@@ -329,6 +332,65 @@ def _configure_traces(settings: OpenTelemetrySettings, resource: object) -> obje
         tracer_provider.add_span_processor(processor_class(exporter))
     trace.set_tracer_provider(tracer_provider)
     return tracer_provider
+
+
+def _configure_logs(settings: OpenTelemetrySettings, resource: object) -> object:
+    """Configure an OTLP logs provider; respects a host-configured provider."""
+    api_logs = importlib.import_module("opentelemetry._logs")
+    provider = api_logs.get_logger_provider()
+    if not _is_default_provider(provider):
+        return provider
+
+    logger_provider_class = _required_symbol("opentelemetry.sdk._logs", "LoggerProvider")
+    exporter_class = _required_symbol(
+        "opentelemetry.exporter.otlp.proto.http._log_exporter",
+        "OTLPLogExporter",
+    )
+    processor_class = _required_symbol(
+        "opentelemetry.sdk._logs.export",
+        "BatchLogRecordProcessor",
+    )
+    exporter = exporter_class(
+        endpoint=settings.exporter_otlp_endpoint,
+        headers=_headers(settings.exporter_otlp_headers),
+    )
+    logger_provider = logger_provider_class(resource=resource)
+    logger_provider.add_log_record_processor(processor_class(exporter))
+    api_logs.set_logger_provider(logger_provider)
+    return logger_provider
+
+
+class OtelLogsSink:
+    """Emit wide events through the OpenTelemetry Logs API as standard log records.
+
+    Pairs with an OTLP logs provider configured by `configure_open_telemetry`
+    (or by the host application). Event payloads keep their OTel Logs Data
+    Model field names, so the mapping is one-to-one.
+    """
+
+    def __init__(self, scope_name: str = _TRACER_NAME) -> None:
+        api_logs = importlib.import_module("opentelemetry._logs")
+        self._severity_number_class = api_logs.SeverityNumber
+        self._logger = api_logs.get_logger(scope_name)
+
+    def emit(self, event: Mapping[str, Any]) -> None:
+        attributes = event.get("attributes")
+        attribute_fields: Mapping[str, object] = (
+            cast(Mapping[str, object], attributes) if isinstance(attributes, Mapping) else {}
+        )
+        severity_number = event.get("severity_number")
+        self._logger.emit(
+            timestamp=cast(int | None, event.get("time_unix_nano")),
+            severity_number=(
+                self._severity_number_class(severity_number)
+                if isinstance(severity_number, int)
+                else None
+            ),
+            severity_text=cast(str | None, event.get("severity_text")),
+            body=cast(str | None, event.get("body")),
+            attributes=span_attributes(attribute_fields),
+            event_name=cast(str | None, event.get("event_name")),
+        )
 
 
 def _configure_metrics(settings: OpenTelemetrySettings, resource: object) -> object:
