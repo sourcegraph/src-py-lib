@@ -17,6 +17,7 @@
 actionlint
 npx --yes markdownlint-cli2@0.22.1
 uv sync
+uv run python tests/unicode_scan.py
 uv run ruff format .
 uv run ruff check .
 uv run pyright
