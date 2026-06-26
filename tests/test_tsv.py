@@ -31,9 +31,9 @@ class TSVTest(unittest.TestCase):
 
     def test_display_width_handles_wide_and_combining_characters(self) -> None:
         self.assertEqual(display_width("a"), 1)
-        self.assertEqual(display_width("測"), 2)
+        self.assertEqual(display_width("\u6e2c"), 2)
         self.assertEqual(display_width("e\u0301"), 1)
-        self.assertEqual(pad_display("測", 4), "測  ")
+        self.assertEqual(pad_display("\u6e2c", 4), "\u6e2c  ")
 
     def test_write_tsv_creates_aligned_table(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

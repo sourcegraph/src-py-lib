@@ -378,7 +378,7 @@ def cli_logging_handlers(
     """Attach terminal (and optional bridge) handlers to the named loggers.
 
     Adds and removes only its own handlers, restores prior logger levels on
-    exit, and never touches the root logger or other handlers — safe to
+    exit, and never touches the root logger or other handlers - safe to
     compose with a host application's logging configuration.
 
     With `suppress_http_dependency_logs=False`, httpx/httpcore loggers are
