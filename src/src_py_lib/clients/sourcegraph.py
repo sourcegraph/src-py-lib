@@ -160,7 +160,10 @@ class SourcegraphClientConfig(Config):
         env_var="SRC_ENDPOINT",
         cli_flag="--src-endpoint",
         metavar="URL",
-        help="Sourcegraph instance URL",
+        help=(
+            "Sourcegraph instance URL\n"
+            "Required as either env var or arg. Recommended to set SRC_ENDPOINT env var"
+        ),
         help_group="Sourcegraph",
         required=True,
     )
@@ -169,7 +172,10 @@ class SourcegraphClientConfig(Config):
         env_var="SRC_ACCESS_TOKEN",
         cli_flag="--src-access-token",
         metavar="TOKEN",
-        help="Sourcegraph access token, or op:// secret reference",
+        help=(
+            "Sourcegraph access token, or op:// secret reference\n"
+            "Required as either env var or arg. Recommended to set SRC_ACCESS_TOKEN env var"
+        ),
         help_group="Sourcegraph",
         secret=True,
         required=True,
