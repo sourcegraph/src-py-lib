@@ -124,7 +124,7 @@ from src_py_lib.utils.telemetry import (
     open_telemetry_settings_from_config,
     traceparent_fields,
 )
-from src_py_lib.utils.tsv import write_tsv
+from src_py_lib.utils.tsv import display_width, pad_display, write_tsv
 
 
 def logging(
@@ -274,4 +274,6 @@ __all__ = [
     "warning",
     "write_session",
     "write_tsv",
+    "display_width",
+    "pad_display",
 ]
