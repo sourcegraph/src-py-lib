@@ -27,7 +27,12 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import src_py_lib as src
-from src_py_lib.clients.github import GitHubClient, graphql_api_url, pr_ref_from_url
+from src_py_lib.clients.github import (
+    GitHubClient,
+    graphql_api_url,
+    pr_ref_from_url,
+    rest_api_url,
+)
 from src_py_lib.clients.google_sheets import GoogleSheetsClient
 from src_py_lib.clients.graphql import (
     GraphQLClient,
@@ -42,6 +47,12 @@ from src_py_lib.clients.one_password import (
     resolve_op_secret_ref,
 )
 from src_py_lib.clients.slack import SlackClient
+from src_py_lib.clients.slack_session import (
+    SlackSession,
+    read_session,
+    slack_client_from_session,
+    write_session,
+)
 from src_py_lib.clients.sourcegraph import (
     SourcegraphClient,
     SourcegraphClientConfig,
@@ -2443,6 +2454,82 @@ query Items($first: Int!, $after: String) {
         self.assertEqual(client.validate(), response)
         self.assertEqual(http.calls[0]["url"], "https://slack.com/api/auth.test")
         self.assertEqual(http.calls[0]["headers"], {"Authorization": "Bearer token"})
+
+    def test_slack_session_client_sends_cookie_and_search_pages(self) -> None:
+        def page(number: int, pages: int) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "messages": {
+                    "matches": [{"ts": f"{number}.0"}],
+                    "paging": {"page": number, "pages": pages},
+                },
+            }
+
+        http = RecordingHTTP([page(1, 2), page(2, 2)])
+        session = SlackSession("https://example.slack.com", "xoxc-token", "cookie-value")
+        client = slack_client_from_session(session, http=http)
+
+        matches = client.search_messages("from:<@U1>", count=1)
+
+        self.assertEqual([match["ts"] for match in matches], ["1.0", "2.0"])
+        self.assertEqual(
+            http.calls[0]["headers"],
+            {"Authorization": "Bearer xoxc-token", "Cookie": "d=cookie-value"},
+        )
+        self.assertEqual(http.calls[1]["query"], {"query": "from:<@U1>", "count": 1, "page": 2})
+
+    def test_slack_session_round_trips_through_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.json"
+            session = SlackSession("https://example.slack.com", "xoxc-token", "cookie")
+            write_session(path, session)
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(read_session(path), session)
+            self.assertIsNone(read_session(Path(directory) / "missing.json"))
+
+    def test_github_search_pull_requests_adds_is_pr_and_flattens_repository(self) -> None:
+        http = RecordingHTTP(
+            [
+                {
+                    "data": {
+                        "search": {
+                            "nodes": [
+                                {
+                                    "title": "Fix",
+                                    "url": "https://github.com/o/r/pull/1",
+                                    "state": "MERGED",
+                                    "createdAt": "2026-05-02T00:00:00Z",
+                                    "mergedAt": "2026-05-03T00:00:00Z",
+                                    "closedAt": "2026-05-03T00:00:00Z",
+                                    "author": {"login": "alice"},
+                                    "repository": {"nameWithOwner": "o/r"},
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            ]
+        )
+        client = GitHubClient("token", http=http)
+
+        pull_requests = client.search_pull_requests("author:alice created:>=2026-05-01")
+
+        self.assertEqual(pull_requests[0]["repository"], "o/r")
+        self.assertEqual(pull_requests[0]["author"], "alice")
+        variables = json_dict(json_dict(http.calls[0]["json_body"]).get("variables"))
+        self.assertEqual(variables.get("query"), "is:pr author:alice created:>=2026-05-01")
+
+    def test_github_search_commits_uses_rest_api_and_stops_at_total(self) -> None:
+        http = RecordingHTTP([{"total_count": 1, "items": [{"sha": "abc"}]}])
+        client = GitHubClient("token", github_url="https://github.example.com", http=http)
+
+        commits = client.search_commits("author:alice")
+
+        self.assertEqual([commit["sha"] for commit in commits], ["abc"])
+        self.assertEqual(http.calls[0]["url"], "https://github.example.com/api/v3/search/commits")
+        self.assertEqual(rest_api_url(), "https://api.github.com")
 
     def test_google_sheets_client_validate_fetches_metadata(self) -> None:
         metadata = {"sheets": [{"properties": {"sheetId": 1, "title": "Sheet1"}}]}

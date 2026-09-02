@@ -14,7 +14,9 @@ from src_py_lib.utils.json_types import JSONDict, json_dict, json_list, json_str
 
 SLACK_API_URL: Final[str] = "https://slack.com/api"
 DEFAULT_PAGE_LIMIT: Final[int] = 200
+DEFAULT_SEARCH_PAGE_COUNT: Final[int] = 100
 DEFAULT_METHOD_INTERVAL_SECONDS: Final[float] = 1.3
+SESSION_COOKIE_NAME: Final[str] = "d"
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +69,22 @@ class SlackPacer:
 
 @dataclass
 class SlackClient:
+    """Slack Web API client for a bot/user token, or a browser session.
+
+    A browser session (`xoxc-...` token from the web client) also needs the
+    `d` session cookie; pass it as `session_cookie`. See `slack_session.py`.
+    """
+
     token: str
     http: HTTPClient = field(default_factory=lambda: HTTPClient(max_attempts=1))
     pacer: SlackPacer = field(default_factory=SlackPacer)
+    session_cookie: str = ""
+
+    def headers(self) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if self.session_cookie:
+            headers["Cookie"] = f"{SESSION_COOKIE_NAME}={self.session_cookie}"
+        return headers
 
     def get(self, method: str, params: dict[str, Any] | None = None) -> JSONDict:
         while True:
@@ -78,7 +93,7 @@ class SlackClient:
                 data = self.http.json(
                     "GET",
                     f"{SLACK_API_URL}/{method}",
-                    headers={"Authorization": f"Bearer {self.token}"},
+                    headers=self.headers(),
                     query=params or {},
                 )
             except HTTPClientError as exception:
@@ -117,6 +132,26 @@ class SlackClient:
 
     def list_users(self) -> list[JSONDict]:
         return self.paginate("users.list", collection_key="members")
+
+    def search_messages(
+        self, query: str, *, count: int = DEFAULT_SEARCH_PAGE_COUNT
+    ) -> list[JSONDict]:
+        """Return every match for a Slack search query (needs a user or session token).
+
+        `search.messages` pages by number, not cursor, and stops at 100 pages;
+        split the query by date (`after:` / `before:`) when `total` exceeds that.
+        """
+        matches: list[JSONDict] = []
+        page = 1
+        while True:
+            data = self.get("search.messages", {"query": query, "count": count, "page": page})
+            messages = json_dict(data.get("messages"))
+            matches.extend(json_dict(item) for item in json_list(messages.get("matches")))
+            paging = json_dict(messages.get("paging"))
+            pages = paging.get("pages")
+            if not isinstance(pages, int) or page >= pages:
+                return matches
+            page += 1
 
     def validate(self) -> JSONDict:
         """Validate the token with Slack auth.test and return the response."""

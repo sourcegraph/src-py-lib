@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TypedDict, cast
 from urllib.parse import urlsplit
 
 from src_py_lib.clients.graphql import GraphQLClient, aliased_batched_query
 from src_py_lib.utils.http import HTTPClient
-from src_py_lib.utils.json_types import JSONDict, json_dict, json_str
+from src_py_lib.utils.json_types import JSONDict, json_dict, json_dicts, json_list, json_str
 
 DEFAULT_GITHUB_URL = "https://github.com"
 DEFAULT_PR_BATCH_SIZE = 50
@@ -22,6 +23,27 @@ query GitHubClientValidate {
   }
 }
 """
+PULL_REQUEST_SEARCH_QUERY = """
+query SearchPullRequests($query: String!, $first: Int!, $after: String) {
+  search(query: $query, type: ISSUE, first: $first, after: $after) {
+    nodes {
+      ... on PullRequest {
+        title
+        url
+        state
+        createdAt
+        mergedAt
+        closedAt
+        author { login }
+        repository { nameWithOwner }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+REST_SEARCH_PAGE_SIZE = 100
+REST_SEARCH_RESULT_CAP = 1000
 PR_REF_RE = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^/#]+)#(?P<number>\d+)$")
 PR_URL_RE = re.compile(
     r"https?://[^/\s)>|]+/(?P<owner>[^/\s)>|]+)/(?P<repo>[^/\s)>|]+)/pull/(?P<number>\d+)"
@@ -36,6 +58,10 @@ class PullRequest(TypedDict):
     mergedAt: str
     closedAt: str
     author: str
+
+
+class SearchedPullRequest(PullRequest):
+    repository: str  # owner/name
 
 
 @dataclass
@@ -83,6 +109,58 @@ class GitHubClient:
             ),
         )
 
+    def search_pull_requests(
+        self, query: str, *, page_size: int = REST_SEARCH_PAGE_SIZE
+    ) -> list[SearchedPullRequest]:
+        """Return pull requests matching a GitHub search, e.g. `author:x created:>=2026-05-01`.
+
+        `is:pr` is added when absent. GitHub search returns at most 1000 results;
+        narrow the query by date when that cap is hit.
+        """
+        if "is:pr" not in query:
+            query = f"is:pr {query}"
+        data = self.graphql(PULL_REQUEST_SEARCH_QUERY, {"query": query, "first": page_size})
+        return [
+            {
+                **_pull_request_fields(node),
+                "repository": json_str(json_dict(node.get("repository")), "nameWithOwner"),
+            }
+            for node in json_dicts(json_dict(data.get("search")).get("nodes"))
+            if node
+        ]
+
+    def search_commits(self, query: str) -> list[JSONDict]:
+        """Return commits matching a GitHub commit search, e.g. `author:x author-date:>=2026-05-01`.
+
+        Uses the REST search API (no GraphQL equivalent), capped at 1000 results.
+        """
+        commits: list[JSONDict] = []
+        page = 1
+        while True:
+            data = self.rest_get(
+                "search/commits",
+                {"q": query, "per_page": REST_SEARCH_PAGE_SIZE, "page": page},
+            )
+            items = json_list(data.get("items"))
+            commits.extend(json_dict(item) for item in items)
+            total = data.get("total_count")
+            if len(items) < REST_SEARCH_PAGE_SIZE or not isinstance(total, int):
+                return commits
+            if len(commits) >= min(total, REST_SEARCH_RESULT_CAP):
+                return commits
+            page += 1
+
+    def rest_get(self, path: str, query: Mapping[str, str | int] | None = None) -> JSONDict:
+        return self.http.json(
+            "GET",
+            f"{rest_api_url(self.github_url)}/{path.lstrip('/')}",
+            headers={
+                "Authorization": f"bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+            },
+            query=dict(query or {}),
+        )
+
 
 def graphql_api_url(github_url: str = DEFAULT_GITHUB_URL) -> str:
     """Return the GraphQL API URL for github.com or a GitHub Enterprise host."""
@@ -91,6 +169,15 @@ def graphql_api_url(github_url: str = DEFAULT_GITHUB_URL) -> str:
     if split.hostname == "github.com":
         return f"{split.scheme}://api.github.com/graphql"
     return f"{normalized}/api/graphql"
+
+
+def rest_api_url(github_url: str = DEFAULT_GITHUB_URL) -> str:
+    """Return the REST API base URL for github.com or a GitHub Enterprise host."""
+    normalized = _normalize_github_url(github_url)
+    split = urlsplit(normalized)
+    if split.hostname == "github.com":
+        return f"{split.scheme}://api.github.com"
+    return f"{normalized}/api/v3"
 
 
 def gh_cli_token(*, github_url: str = DEFAULT_GITHUB_URL) -> str | None:
@@ -151,6 +238,10 @@ def _project_pull_request(node: JSONDict) -> PullRequest | None:
     pull_request = json_dict(node.get("pullRequest"))
     if not pull_request:
         return None
+    return _pull_request_fields(pull_request)
+
+
+def _pull_request_fields(pull_request: JSONDict) -> PullRequest:
     return {
         "title": json_str(pull_request, "title"),
         "url": json_str(pull_request, "url"),

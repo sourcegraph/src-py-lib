@@ -8,7 +8,13 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
-from src_py_lib.clients.github import GitHubClient, PullRequest, gh_cli_token, pr_ref_from_url
+from src_py_lib.clients.github import (
+    GitHubClient,
+    PullRequest,
+    SearchedPullRequest,
+    gh_cli_token,
+    pr_ref_from_url,
+)
 from src_py_lib.clients.google_sheets import (
     GoogleSheetsClient,
     GoogleSheetsError,
@@ -33,6 +39,13 @@ from src_py_lib.clients.slack import (
     SlackError,
     SlackPacer,
     slack_client_from_config,
+)
+from src_py_lib.clients.slack_session import (
+    SlackSession,
+    browser_signin,
+    read_session,
+    slack_client_from_session,
+    write_session,
 )
 from src_py_lib.clients.sourcegraph import (
     SourcegraphClient,
@@ -194,16 +207,19 @@ __all__ = [
     "OpenTelemetrySetupError",
     "OtelLogsSink",
     "PullRequest",
+    "SearchedPullRequest",
     "SlackClient",
     "SlackClientConfig",
     "SlackError",
     "SlackPacer",
+    "SlackSession",
     "SourcegraphClient",
     "SourcegraphClientConfig",
     "SourcegraphJaegerTraceError",
     "SourcegraphJaegerTraceSummary",
     "SourcegraphTrace",
     "aliased_batched_query",
+    "browser_signin",
     "config_field",
     "config_field_names",
     "config_help_formatter",
@@ -244,9 +260,11 @@ __all__ = [
     "parse_args",
     "pr_ref_from_url",
     "quota_project_from_adc",
+    "read_session",
     "resolve_log_level_name",
     "save_json_cache",
     "slack_client_from_config",
+    "slack_client_from_session",
     "sourcegraph_client_from_config",
     "stage",
     "startup_event",
@@ -254,5 +272,6 @@ __all__ = [
     "submit_with_log_context",
     "traceparent_fields",
     "warning",
+    "write_session",
     "write_tsv",
 ]
