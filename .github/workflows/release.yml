@@ -26,7 +26,7 @@ defaults:
 jobs:
   release_ref:
     name: Resolve release tag
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
@@ -59,7 +59,7 @@ jobs:
   wheel:
     name: Build wheel
     needs: release_ref
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       IMPORT_NAME: src_py_lib
       PYTHON_VERSION: "3.11"
@@ -272,7 +272,7 @@ jobs:
   github-release:
     name: Publish GitHub release assets
     needs: [release_ref, validate, wheel]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
 
@@ -316,7 +316,7 @@ jobs:
   pypi:
     name: Publish PyPI package
     needs: [validate, wheel]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
