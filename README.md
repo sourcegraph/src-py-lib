@@ -59,6 +59,7 @@ class LinearExportConfig(src.LinearClientConfig):
         help="Directory for generated files.",
     )
 
+
 config = src.parse_args(LinearExportConfig, description="Export Linear data")
 
 with src.logging(config):
