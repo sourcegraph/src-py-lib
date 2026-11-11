@@ -94,6 +94,7 @@ jobs:
     if: needs.changes.outputs.github_actions == 'true'
     runs-on: ubuntu-24.04
     env:
+      # renovate: datasource=github-releases depName=rhysd/actionlint extractVersion=^v(?<version>.*)$
       ACTIONLINT_VERSION: "1.7.12"
 
     steps:
@@ -126,6 +127,7 @@ jobs:
     if: needs.changes.outputs.markdown == 'true'
     runs-on: ubuntu-24.04
     env:
+      # renovate: datasource=npm depName=markdownlint-cli2
       MARKDOWNLINT_CLI2_VERSION: "0.22.1"
 
     steps:
@@ -152,6 +154,7 @@ jobs:
     env:
       IMPORT_NAME: src_py_lib
       PYTHON_VERSION: "3.11"
+      # renovate: datasource=pypi depName=uv
       UV_VERSION: "0.11.7"
 
     steps:
@@ -215,6 +218,7 @@ jobs:
     env:
       IMPORT_NAME: src_py_lib
       PYTHON_VERSION: "3.11"
+      # renovate: datasource=pypi depName=uv
       UV_VERSION: "0.11.7"
 
     steps:
