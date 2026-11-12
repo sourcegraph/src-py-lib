@@ -154,7 +154,8 @@ jobs:
           mkdir -p "${dist_dir}"
           shopt -s nullglob
 
-          uv build --wheel --sdist --out-dir "${dist_dir}" --no-create-gitignore
+          uv build --wheel --sdist --out-dir "${dist_dir}" --no-create-gitignore \
+            --build-constraints build-requirements.txt --require-hashes
           project_wheels=("${dist_dir}"/*.whl)
           if [[ "${#project_wheels[@]}" -ne 1 ]]; then
             echo "::error title=Unexpected wheel count::Expected one project wheel, found ${#project_wheels[@]}."

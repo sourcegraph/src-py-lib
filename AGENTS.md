@@ -60,6 +60,9 @@ uv run python -m unittest discover -s tests
 - The release workflow builds from the tag and checks that wheel and source
   distribution filenames match the tag version before publishing.
 - Do not make the release workflow edit `pyproject.toml` or `uv.lock`.
+- `build-requirements.txt` pins the build backend and everything it installs
+  to hashes. `uv build` fails on any build requirement missing from it, so a
+  new entry in `build-system.requires` needs the file regenerated.
 - The release workflow fails when `uv.lock` is behind the latest releases
   `pyproject.toml` allows. Before tagging, merge open Renovate PRs and run the
   freshness check on `origin/main`. If it lists updates, tick the lock file
