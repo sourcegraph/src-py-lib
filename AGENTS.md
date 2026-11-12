@@ -33,6 +33,9 @@ uv run python -m unittest discover -s tests
 - Use `uv` for dependency management, virtualenv creation, and command running
 - Use pyright in strict mode; fix linting / typing issues instead of suppressing them
 - Use ruff for formatting, import sorting, and linting
+- Dependencies wait 3 days after release: `minimumReleaseAge` in
+  `renovate.json`, and `--uploaded-prior-to P3D` where workflows `pip install`
+  uv. pip reports a younger pin as `No matching distribution found`.
 
 ## Runtime standards
 
