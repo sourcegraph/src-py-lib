@@ -137,7 +137,7 @@ jobs:
     runs-on: ubuntu-26.04
     env:
       # renovate: datasource=npm depName=markdownlint-cli2
-      MARKDOWNLINT_CLI2_VERSION: "0.22.1"
+      MARKDOWNLINT_CLI2_VERSION: "0.24.1"
 
     steps:
       - name: Check out code
