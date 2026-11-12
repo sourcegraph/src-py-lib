@@ -60,6 +60,10 @@ uv run python -m unittest discover -s tests
 - The release workflow builds from the tag and checks that wheel and source
   distribution filenames match the tag version before publishing.
 - Do not make the release workflow edit `pyproject.toml` or `uv.lock`.
+- The release workflow fails when `uv.lock` is behind the latest releases
+  `pyproject.toml` allows. Before tagging, merge open Renovate PRs and run the
+  freshness check on `origin/main`. If it lists updates, tick the lock file
+  maintenance box on the Dependency Dashboard issue and merge that PR first.
 - Tag the remote head of `main` directly:
 
 ```sh
@@ -71,6 +75,8 @@ GH_REPO="sourcegraph/src-py-lib"
 
 [[ "${VERSION_INPUT}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
 git fetch origin --tags --prune
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+uv lock --upgrade --refresh --dry-run 2>&1 | tee /dev/stderr | grep "No lockfile changes detected"
 MAIN_COMMIT="$(git rev-parse origin/main)"
 git tag -a "v${VERSION}" "${MAIN_COMMIT}" -m "Release v${VERSION}"
 git push origin "v${VERSION}"
