@@ -10,6 +10,7 @@
       "before 4am"
     ]
   },
+  "minimumReleaseAge": "3 days",
   "osvVulnerabilityAlerts": true,
   "packageRules": [
     {
