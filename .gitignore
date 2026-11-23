@@ -18,4 +18,3 @@ wheels/
 
 # Allow
 !.env.example
-!.markdownlint-cli2.yaml
