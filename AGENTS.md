@@ -15,8 +15,8 @@
 
 ```sh
 actionlint
-npx --yes markdownlint-cli2@0.22.1
 uv sync
+uv run rumdl check .
 uv run python tests/unicode_scan.py
 uv run ruff format .
 uv run ruff check .
@@ -33,9 +33,20 @@ uv run python -m unittest discover -s tests
 - Use `uv` for dependency management, virtualenv creation, and command running
 - Use pyright in strict mode; fix linting / typing issues instead of suppressing them
 - Use ruff for formatting, import sorting, and linting
-- Dependencies wait 3 days after release: `minimumReleaseAge` in
-  `renovate.json`, and `--uploaded-prior-to P3D` where workflows `pip install`
-  uv. pip reports a younger pin as `No matching distribution found`.
+- Use rumdl for Markdown linting: `uv run rumdl check .`
+- Dependencies wait 3 days after release: `exclude-newer` in `pyproject.toml`,
+  `minimumReleaseAge` in `renovate.json`, and `--uploaded-prior-to P3D` where
+  workflows `pip install` uv. pip reports a younger pin as
+  `No matching distribution found`.
+- To take a release younger than 3 days, add
+  `exclude-newer-package = { <name> = false }` under `[tool.uv]`, run
+  `uv lock --upgrade-package <name>`, and remove the line once the release is
+  3 days old. A young release that requires another young release needs both
+  names.
+- Renovate merges its own pull requests when the checks pass, major updates
+  included. It opens one grouped pull request for minor and patch updates and
+  one lock file maintenance pull request a week, one pull request per major
+  update, and security fixes at any time.
 
 ## Runtime standards
 
@@ -62,14 +73,14 @@ uv run python -m unittest discover -s tests
   from `origin/main`.
 - The release workflow builds from the tag and checks that wheel and source
   distribution filenames match the tag version before publishing.
-- Do not make the release workflow edit `pyproject.toml` or `uv.lock`.
+- The release workflow upgrades every dependency to its latest release that
+  `pyproject.toml` allows (`uv lock --upgrade`), validates with that lockfile,
+  and does not commit it.
+- Keep the checkout that builds the distributions unmodified: `hatch-vcs`
+  gives a modified checkout a development version.
 - `build-requirements.txt` pins the build backend and everything it installs
   to hashes. `uv build` fails on any build requirement missing from it, so a
   new entry in `build-system.requires` needs the file regenerated.
-- The release workflow fails when `uv.lock` is behind the latest releases
-  `pyproject.toml` allows. Before tagging, merge open Renovate PRs and run the
-  freshness check on `origin/main`. If it lists updates, tick the lock file
-  maintenance box on the Dependency Dashboard issue and merge that PR first.
 - Tag the remote head of `main` directly:
 
 ```sh
@@ -81,8 +92,6 @@ GH_REPO="sourcegraph/src-py-lib"
 
 [[ "${VERSION_INPUT}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
 git fetch origin --tags --prune
-test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
-uv lock --upgrade --refresh --dry-run 2>&1 | tee /dev/stderr | grep "No lockfile changes detected"
 MAIN_COMMIT="$(git rev-parse origin/main)"
 git tag -a "v${VERSION}" "${MAIN_COMMIT}" -m "Release v${VERSION}"
 git push origin "v${VERSION}"

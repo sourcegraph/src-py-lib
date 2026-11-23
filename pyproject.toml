@@ -8,6 +8,7 @@ dev = [
     "opentelemetry-sdk>=1.45.2,<2",
     "pyright>=1.1.414",
     "ruff>=0.17.5",
+    "rumdl>=0.3.4",
 ]
 
 [project]
@@ -69,5 +70,11 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 
+[tool.rumdl]
+line-length = 100
+
 [tool.uv]
+# Resolve only releases that are at least 3 days old. To take a younger release
+# of one package, add `exclude-newer-package = { <name> = false }` here.
+exclude-newer = "3 days"
 package = true

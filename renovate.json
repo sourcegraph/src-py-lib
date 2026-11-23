@@ -2,13 +2,14 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>sourcegraph/renovate-config",
-    "customManagers:githubActionsVersions"
+    "customManagers:githubActionsVersions",
+    "group:allNonMajor",
+    "schedule:weekly"
   ],
+  "automerge": true,
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": [
-      "before 4am"
-    ]
+    "minimumReleaseAge": null
   },
   "minimumReleaseAge": "3 days",
   "osvVulnerabilityAlerts": true,
@@ -35,7 +36,6 @@
       "enabled": false
     }
   ],
-  "schedule": [
-    "at any time"
-  ]
+  "platformAutomerge": false,
+  "rangeStrategy": "replace"
 }

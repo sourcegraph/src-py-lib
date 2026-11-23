@@ -84,5 +84,5 @@ uv run ruff format .
 uv run ruff check .
 uv run pyright
 uv run python -m unittest discover -s tests
-npx --yes markdownlint-cli2
+uv run rumdl check .
 ```
