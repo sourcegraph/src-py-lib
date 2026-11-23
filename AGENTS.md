@@ -15,8 +15,8 @@
 
 ```sh
 actionlint
-npx --yes markdownlint-cli2@0.22.1
 uv sync
+uv run rumdl check .
 uv run python tests/unicode_scan.py
 uv run ruff format .
 uv run ruff check .
@@ -43,9 +43,10 @@ uv run python -m unittest discover -s tests
   `uv lock --upgrade-package <name>`, and remove the line once the release is
   3 days old. A young release that requires another young release needs both
   names.
-- Renovate merges its own pull requests when the checks pass, except major
-  updates. It opens one grouped pull request and one lock file maintenance
-  pull request a week, and security fixes at any time.
+- Renovate merges its own pull requests when the checks pass, major updates
+  included. It opens one grouped pull request for minor and patch updates and
+  one lock file maintenance pull request a week, one pull request per major
+  update, and security fixes at any time.
 
 ## Runtime standards
 
